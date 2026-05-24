@@ -1,0 +1,10 @@
+.git
+.github
+.cursor
+.codegraph
+*.md
+!README.md
+trace-dumps
+*.sqlite3
+dsproxy
+dsproxy.exe

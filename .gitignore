@@ -1,0 +1,13 @@
+.env
+.cursor/
+.codegraph/
+/dsproxy
+/dsproxy.exe
+*.exe
+*.test
+/vendor/
+.idea/
+.vscode/
+*.sqlite3
+trace-dumps/
+*.log
