@@ -1,7 +1,7 @@
 services:
   dsproxy:
-    build: .
     image: ghcr.io/mewisme/dsproxy:latest
+    pull_policy: always
     container_name: dsproxy
     restart: unless-stopped
     ports:

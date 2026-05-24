@@ -62,7 +62,17 @@ If Cursor rejects `localhost`, set `HOST=0.0.0.0` and use `http://<your-lan-ip>:
 
 ```bash
 cp .env.example .env
-docker compose up --build
+docker compose pull
+docker compose up -d
+```
+
+If the cache volume was created with wrong permissions, reset it once:
+
+```bash
+docker compose down
+docker volume rm deepseek-v4-proxy_dsproxy-cache
+docker compose pull
+docker compose up -d
 ```
 
 Or without Compose:
@@ -93,7 +103,7 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-Image: `ghcr.io/mewisme/dsproxy:v0.1.0`
+Image: `ghcr.io/mewisme/dsproxy:latest`
 
 ## License
 

@@ -33,12 +33,13 @@ func Open(path string, maxAgeSeconds, maxRows int) (*Store, error) {
 		s.db, err = sql.Open("sqlite", ":memory:")
 	} else {
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("create reasoning cache dir %s: %w", filepath.Dir(path), err)
 		}
 		s.db, err = sql.Open("sqlite", path)
-		if err == nil {
-			_ = os.Chmod(path, 0o600)
+		if err != nil {
+			return nil, fmt.Errorf("open reasoning cache at %s: %w", path, err)
 		}
+		_ = os.Chmod(path, 0o600)
 	}
 	if err != nil {
 		return nil, err
