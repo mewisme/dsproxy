@@ -88,7 +88,7 @@ func warnInsecureUpstream(baseURL string) {
 		return
 	}
 	host := u.Hostname()
-	if host == "127.0.0.1" || host == "localhost" || host == "::1" {
+	if host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "0.0.0.0" {
 		return
 	}
 	slog.Warn("upstream base_url uses plain HTTP; bearer tokens may be exposed")

@@ -14,7 +14,7 @@ const (
 	EnvFileName              = ".env"
 	ReasoningContentFileName = "reasoning_content.sqlite3"
 
-	DefaultHost                        = "127.0.0.1"
+	DefaultHost                        = "0.0.0.0"
 	DefaultPort                        = 9999
 	DefaultUpstreamBaseURL             = "https://api.deepseek.com"
 	DefaultUpstreamModel               = "deepseek-v4-pro"

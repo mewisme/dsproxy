@@ -28,7 +28,7 @@ var tools = []any{
 	map[string]any{
 		"type": "function",
 		"function": map[string]any{
-			"name": "get_date",
+			"name":       "get_date",
 			"parameters": map[string]any{"type": "object", "properties": map[string]any{}},
 		},
 	},
@@ -37,9 +37,9 @@ var tools = []any{
 		"function": map[string]any{
 			"name": "get_weather",
 			"parameters": map[string]any{
-				"type": "object",
+				"type":       "object",
 				"properties": map[string]any{"date": map[string]any{"type": "string"}},
-				"required":     []any{"date"},
+				"required":   []any{"date"},
 			},
 		},
 	},
@@ -59,7 +59,7 @@ func TestCanonicalFourTurnToolCallLoop(t *testing.T) {
 	defer store.Close()
 
 	cfg := config.ProxyConfig{
-		Host:                     "127.0.0.1",
+		Host:                     "0.0.0.0",
 		Port:                     0,
 		UpstreamBaseURL:          upstream.URL,
 		UpstreamModel:            "deepseek-v4-pro",
