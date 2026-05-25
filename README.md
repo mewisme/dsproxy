@@ -47,21 +47,22 @@ Default base URL: `http://127.0.0.1:9999/v1`
 
 ```bash
 cp .env.example .env
-# For containers, bind on all interfaces (see Configuration)
-echo HOST=0.0.0.0 >> .env
+# Docker: bind inside the container and publish on the host
+# HOST=0.0.0.0
+# PORT=9999
+# HOST_PORT=8080   # optional — host side only (maps to container :9999)
 
 docker compose pull
 docker compose up -d
 ```
 
-Health check: `curl http://127.0.0.1:9999/health`
+Health check: `curl http://127.0.0.1:9999/health` (use your `HOST_PORT` value if you changed the host mapping)
 
 ### Published image (no Compose)
 
 ```bash
 docker pull ghcr.io/mewisme/dsproxy:latest
-docker run --rm -p 9999:9999 \
-  -e HOST=0.0.0.0 \
+docker run --rm -p "${HOST_PORT:-9999}:9999" \
   --env-file .env \
   -v dsproxy-cache:/home/nonroot/.dsproxy \
   ghcr.io/mewisme/dsproxy:latest
@@ -84,7 +85,8 @@ Copy [`.env.example`](.env.example) to `.env` in the project directory. If no pr
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `HOST` | `127.0.0.1` | Bind address. Use `0.0.0.0` for LAN or Docker. |
-| `PORT` | `9999` | Listen port |
+| `PORT` | `9999` | Listen port (keep `9999` in Docker; app port inside the container) |
+| `HOST_PORT` | `9999` | Docker Compose / `docker run -p` only — published port on the host (`HOST_PORT:9999`) |
 | `BASE_URL` | `https://api.deepseek.com` | Upstream DeepSeek API base URL |
 | `MODEL` | `deepseek-v4-pro` | Default model when the client omits `model` |
 | `THINKING` | `enabled` | `enabled` or `disabled` — forwarded as DeepSeek `thinking.type` |
@@ -121,7 +123,7 @@ Upstream payloads still carry real `reasoning_content` for API correctness.
 ## Docker notes
 
 - The image runs as user `nonroot` (uid 65532). Cache data lives in `/home/nonroot/.dsproxy` (Compose volume `dsproxy-cache`).
-- Set `HOST=0.0.0.0` in `.env` so port publishing works from outside the container.
+- Compose reads config from `.env` only (`env_file`). Set `HOST=0.0.0.0` and `PORT=9999` in `.env` for containers. Use `HOST_PORT` to change the published port on the host (`${HOST_PORT}:9999`); the app always listens on `PORT` (**9999**) inside the container.
 - `REASONING_CONTENT_PATH` defaults to `/home/nonroot/.dsproxy/reasoning_content.sqlite3` in Compose.
 
 Reset a corrupted cache volume:
@@ -136,7 +138,7 @@ Build locally:
 
 ```bash
 docker build -t dsproxy:local .
-docker run --rm -p 9999:9999 -e HOST=0.0.0.0 --env-file .env -v dsproxy-cache:/home/nonroot/.dsproxy dsproxy:local
+docker run --rm -p "${HOST_PORT:-9999}:9999" --env-file .env -v dsproxy-cache:/home/nonroot/.dsproxy dsproxy:local
 ```
 
 ## Development
