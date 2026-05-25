@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"regexp"
 	"strings"
 
@@ -453,12 +452,11 @@ func NormalizeMessages(
 }
 
 func UpstreamModelFor(original string, cfg config.ProxyConfig) string {
-	if strings.HasPrefix(original, "deepseek-") {
-		return original
+	original = strings.TrimSpace(original)
+	if original == "" {
+		return cfg.UpstreamModel
 	}
-	slog.Warn("rewriting non-DeepSeek model to configured fallback",
-		"original", original, "fallback", cfg.UpstreamModel)
-	return cfg.UpstreamModel
+	return original
 }
 
 func ReasoningModelFamily(upstreamModel string) string {

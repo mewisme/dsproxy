@@ -20,6 +20,6 @@ COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 WORKDIR /home/nonroot
 EXPOSE 9999
-ENV HOST=0.0.0.0
+ENV HOST=127.0.0.1
 ENV PORT=9999
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

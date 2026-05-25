@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"dsproxy/internal/config"
@@ -18,9 +19,11 @@ import (
 )
 
 type Handler struct {
-	Config config.ProxyConfig
-	Store  *reasoning.Store
-	Client *http.Client
+	Config       config.ProxyConfig
+	Store        *reasoning.Store
+	Client       *http.Client
+	mu           sync.Mutex
+	currentModel string
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -56,7 +59,7 @@ func (h *Handler) handleOptions(w http.ResponseWriter, r *http.Request, path str
 
 func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request, path string) {
 	switch path {
-	case "/healthz", "/v1/healthz":
+	case "/health", "/healthz", "/v1/health", "/v1/healthz":
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	case "/models", "/v1/models":
 		h.sendModels(w)
@@ -65,9 +68,37 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request, path string)
 	}
 }
 
+func (h *Handler) activeModel() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.currentModel != "" {
+		return h.currentModel
+	}
+	return h.Config.UpstreamModel
+}
+
+func (h *Handler) configForRequest(payload map[string]any) config.ProxyConfig {
+	cfg := h.Config
+	if m, ok := payload["model"].(string); ok && strings.TrimSpace(m) != "" {
+		upstream := transform.UpstreamModelFor(strings.TrimSpace(m), cfg)
+		h.mu.Lock()
+		h.currentModel = upstream
+		h.mu.Unlock()
+		return cfg
+	}
+	h.mu.Lock()
+	cm := h.currentModel
+	h.mu.Unlock()
+	if cm != "" {
+		cfg.UpstreamModel = cm
+	}
+	return cfg
+}
+
 func (h *Handler) sendModels(w http.ResponseWriter) {
 	created := time.Now().Unix()
-	ids := []string{h.Config.UpstreamModel, "deepseek-v4-pro", "deepseek-v4-flash"}
+	primary := h.activeModel()
+	ids := []string{primary, h.Config.UpstreamModel, "deepseek-v4-pro", "deepseek-v4-flash"}
 	seen := map[string]struct{}{}
 	var models []any
 	for _, id := range ids {
@@ -116,7 +147,8 @@ func (h *Handler) handlePost(w http.ResponseWriter, r *http.Request, path string
 		summarizeJSONBody("client request body", mustMarshal(payload))
 	}
 
-	prepared := transform.PrepareUpstreamRequest(payload, h.Config, h.Store, auth)
+	cfg := h.configForRequest(payload)
+	prepared := transform.PrepareUpstreamRequest(payload, cfg, h.Store, auth)
 	slog.Info("upstream request prepared", preparedSummary(prepared)...)
 	if h.Config.MissingReasoningStrategy == "reject" && prepared.MissingReasoningMessages > 0 {
 		slog.Warn(
