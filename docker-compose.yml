@@ -9,8 +9,6 @@ services:
     env_file:
       - .env
     environment:
-      HOST: "127.0.0.1"
-      PORT: "${PORT:-9999}"
       BASE_URL: "${BASE_URL:-https://api.deepseek.com}"
       MODEL: "${MODEL:-deepseek-v4-pro}"
       THINKING: "${THINKING:-enabled}"
