@@ -730,7 +730,7 @@ func FoldReasoningIntoContent(response map[string]any, collapsible bool) {
 
 func streamThinkingBlockStart(collapsible bool) string {
 	if collapsible {
-		return "<details>\n<summary>Thinking</summary>\n\n"
+		return "<details open>\n<summary>Thinking</summary>\n\n"
 	}
 	return "<think>\n"
 }

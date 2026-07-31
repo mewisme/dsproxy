@@ -8,16 +8,16 @@ import (
 const (
 	thinkingBlockStart            = "<think>\n"
 	thinkingBlockEnd              = "\n</think>\n\n"
-	collapsibleThinkingBlockStart = "<details>\n<summary>Thinking</summary>\n\n"
+	collapsibleThinkingBlockStart = "<details open>\n<summary>Thinking</summary>\n\n"
 	collapsibleThinkingBlockEnd   = "\n</details>\n\n"
 )
 
 type DisplayAdapter struct {
-	collapsible    bool
-	openChoices    map[int]struct{}
-	lastChunkMeta  map[string]any
-	blockStart     string
-	blockEnd       string
+	collapsible   bool
+	openChoices   map[int]struct{}
+	lastChunkMeta map[string]any
+	blockStart    string
+	blockEnd      string
 }
 
 func NewDisplayAdapter(collapsible bool) *DisplayAdapter {
