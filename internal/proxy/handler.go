@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -137,7 +138,23 @@ func (h *Handler) handlePost(w http.ResponseWriter, r *http.Request, path string
 	}
 
 	cfg := h.configForRequest(payload)
-	prepared := transform.PrepareUpstreamRequest(payload, cfg, h.Store, auth)
+	prepared, err := transform.PrepareUpstreamRequest(payload, cfg, h.Store, auth)
+	if err != nil {
+		var valErr *transform.RequestValidationError
+		if errors.As(err, &valErr) {
+			log.Warn("rejected invalid request", "param", valErr.Param)
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": map[string]any{
+					"message": valErr.Message,
+					"type":    "invalid_request_error",
+					"param":   valErr.Param,
+				},
+			})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]any{"message": err.Error()}})
+		return
+	}
 	log.Info("upstream request prepared", preparedSummary(prepared)...)
 	if h.Config.MissingReasoningStrategy == "reject" && prepared.MissingReasoningMessages > 0 {
 		log.Warn(

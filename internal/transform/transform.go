@@ -1,6 +1,7 @@
 package transform
 
 import (
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -27,7 +28,7 @@ var (
 		"max_tokens": {}, "response_format": {}, "stop": {}, "tools": {},
 		"tool_choice": {}, "thinking": {}, "reasoning_effort": {},
 		"temperature": {}, "top_p": {}, "presence_penalty": {}, "frequency_penalty": {},
-		"logprobs": {}, "top_logprobs": {}, "user": {}, "seed": {}, "n": {}, "logit_bias": {},
+		"logprobs": {}, "top_logprobs": {}, "seed": {}, "n": {}, "logit_bias": {},
 	}
 	messageFields = map[string]struct{}{
 		"role": {}, "content": {}, "name": {}, "tool_call_id": {},
@@ -63,6 +64,17 @@ type PreparedRequest struct {
 type RecordingContext struct {
 	Scope    string
 	Messages []map[string]any
+}
+
+// RequestValidationError signals an invalid client request that
+// should result in HTTP 400.
+type RequestValidationError struct {
+	Message string
+	Param   string
+}
+
+func (e *RequestValidationError) Error() string {
+	return e.Message
 }
 
 func NormalizeReasoningEffort(value any) string {
@@ -494,6 +506,94 @@ func effectiveToolChoice(tools []any, explicit any) any {
 	return "none"
 }
 
+// userIDDomainSep is the domain-separation prefix used as the HMAC message prefix.
+const userIDDomainSep = "dsproxy-user-id-v1"
+
+// validUserIDRe matches the DeepSeek-allowed user_id character set.
+var validUserIDRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,512}$`)
+
+// NormalizeUpstreamUserID resolves the user identity to forward upstream.
+//
+// Precedence:
+//  1. explicit valid user_id is preserved
+//  2. OpenAI-compatible user is mapped to an opaque HMAC digest
+//  3. explicit user_id wins over user when both are present
+//  4. absent, null, empty, or whitespace-only values are treated as no identity
+//
+// Returns (userID, error). userID is empty when no identity is present.
+func NormalizeUpstreamUserID(payload map[string]any, authorization string) (string, error) {
+	rawUser := payload["user"]
+	rawUserID := payload["user_id"]
+
+	// Validate user type — must be string or nil.
+	if rawUser != nil {
+		if _, ok := rawUser.(string); !ok {
+			return "", &RequestValidationError{
+				Message: "invalid user: expected a string",
+				Param:   "user",
+			}
+		}
+	}
+
+	// Validate user_id type — must be string, nil, or numeric (for rejection),
+	// but non-nil non-string is invalid.
+	if rawUserID != nil {
+		if _, ok := rawUserID.(string); !ok {
+			return "", &RequestValidationError{
+				Message: "invalid user_id: expected at most 512 characters from [A-Za-z0-9_-]",
+				Param:   "user_id",
+			}
+		}
+	}
+
+	// Case 3+1: explicit valid user_id wins.
+	if userIDStr, ok := rawUserID.(string); ok {
+		userIDStr = strings.TrimSpace(userIDStr)
+		if userIDStr == "" {
+			return "", nil
+		}
+		if !validUserIDRe.MatchString(userIDStr) {
+			return "", &RequestValidationError{
+				Message: "invalid user_id: expected at most 512 characters from [A-Za-z0-9_-]",
+				Param:   "user_id",
+			}
+		}
+		return userIDStr, nil
+	}
+
+	// Case 2: OpenAI-compatible user → opaque digest.
+	if userStr, ok := rawUser.(string); ok {
+		userStr = strings.TrimSpace(userStr)
+		if userStr == "" {
+			return "", nil
+		}
+		return deriveUserID(userStr, authorization), nil
+	}
+
+	// Case 4: no identity.
+	return "", nil
+}
+
+// deriveUserID produces an opaque, deterministic DeepSeek user_id from an OpenAI user
+// using HMAC-SHA256 keyed by the bearer token (without "Bearer " prefix).
+func deriveUserID(user, authorization string) string {
+	if authorization == "" {
+		// Safety: if authorization is unexpectedly empty, use a static fallback
+		// to avoid creating a globally shared identity.
+		authorization = "dsproxy-fallback-no-auth"
+	}
+	key := authorization
+	if after, ok := strings.CutPrefix(strings.TrimSpace(authorization), "Bearer "); ok {
+		key = strings.TrimSpace(after)
+	}
+	mac := hmac.New(sha256.New, []byte(key))
+	mac.Write([]byte(userIDDomainSep))
+	mac.Write([]byte{0})
+	mac.Write([]byte(user))
+	digest := hex.EncodeToString(mac.Sum(nil))
+	return "u_" + digest[:32]
+}
+
 func RuntimeContextHash(systemMessages []map[string]any, tools any, toolChoice any) string {
 	var canonical []map[string]any
 	for _, m := range systemMessages {
@@ -515,19 +615,20 @@ func RuntimeContextHash(systemMessages []map[string]any, tools any, toolChoice a
 	return reasoning.Sha256JSON(payload)
 }
 
-func ReasoningCacheNamespace(cfg config.ProxyConfig, upstreamModel string, thinking, reasoningEffort any, authorization string, runtimeContextHash string) string {
+func ReasoningCacheNamespace(cfg config.ProxyConfig, upstreamModel string, thinking, reasoningEffort any, authorization string, userID string, runtimeContextHash string) string {
 	authHash := ""
 	if authorization != "" {
 		sum := sha256.Sum256([]byte(authorization))
 		authHash = hex.EncodeToString(sum[:])
 	}
 	payload := map[string]any{
-		"v":                    "v2",
+		"v":                    "v3",
 		"base_url":             cfg.UpstreamBaseURL,
 		"model":                upstreamModel,
 		"thinking":             thinking,
 		"reasoning_effort":     reasoningEffort,
 		"authorization_hash":   authHash,
+		"user_id":              userID,
 		"runtime_context_hash": runtimeContextHash,
 	}
 	return reasoning.Sha256JSON(payload)
@@ -554,7 +655,12 @@ func PrepareUpstreamRequest(
 	cfg config.ProxyConfig,
 	store *reasoning.Store,
 	authorization string,
-) PreparedRequest {
+) (PreparedRequest, error) {
+	userID, err := NormalizeUpstreamUserID(payload, authorization)
+	if err != nil {
+		return PreparedRequest{}, err
+	}
+
 	originalModel := cfg.UpstreamModel
 	if m, ok := payload["model"].(string); ok && m != "" {
 		originalModel = m
@@ -573,6 +679,10 @@ func PrepareUpstreamRequest(
 		}
 	}
 	prepared["model"] = upstreamModel
+
+	if userID != "" {
+		prepared["user_id"] = userID
+	}
 
 	if stream, _ := prepared["stream"].(bool); stream {
 		opts, _ := prepared["stream_options"].(map[string]any)
@@ -624,7 +734,7 @@ func PrepareUpstreamRequest(
 	tools := normalizedToolsForContext(prepared["tools"])
 	toolChoice := effectiveToolChoice(tools, prepared["tool_choice"])
 	contextHash := RuntimeContextHash(systemMessages, tools, toolChoice)
-	cacheNamespace := ReasoningCacheNamespace(cfg, upstreamModel, prepared["thinking"], prepared["reasoning_effort"], authorization, contextHash)
+	cacheNamespace := ReasoningCacheNamespace(cfg, upstreamModel, prepared["thinking"], prepared["reasoning_effort"], authorization, userID, contextHash)
 	recordMessages := preRepair
 	recordScope := reasoning.ConversationScope(recordMessages, cacheNamespace)
 	messagesForRepair := preRepair
@@ -672,7 +782,7 @@ func PrepareUpstreamRequest(
 		RecordResponseScope:        recordScope,
 		RecordResponseMessages:     recordMessages,
 		RecordResponseContexts:     contexts,
-	}
+	}, nil
 }
 
 func RecordResponseReasoning(

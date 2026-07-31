@@ -46,6 +46,12 @@ func (s *Server) ListenAndServe() error {
 	return s.HTTP.ListenAndServe()
 }
 
+// Serve accepts requests from listener using the same handler and HTTP
+// configuration as the local server.
+func (s *Server) Serve(listener net.Listener) error {
+	return s.HTTP.Serve(listener)
+}
+
 func (s *Server) Shutdown(ctx context.Context) error {
 	return s.HTTP.Shutdown(ctx)
 }

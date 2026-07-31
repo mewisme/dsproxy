@@ -32,6 +32,9 @@ const (
 	EnvReasoningCacheMaxRows       = "REASONING_CACHE_MAX_ROWS"
 	EnvClearReasoningCache         = "CLEAR_REASONING_CACHE"
 	EnvTraceDir                    = "TRACE_DIR"
+	EnvNgrokEnabled                = "NGROK_ENABLED"
+	EnvNgrokAuthtoken              = "NGROK_AUTHTOKEN"
+	EnvNgrokURL                    = "NGROK_URL"
 )
 
 // ApplicationEnvVars is the allowlist of all env vars this application reads.
@@ -55,6 +58,9 @@ var ApplicationEnvVars = []string{
 	EnvReasoningCacheMaxRows,
 	EnvClearReasoningCache,
 	EnvTraceDir,
+	EnvNgrokEnabled,
+	EnvNgrokAuthtoken,
+	EnvNgrokURL,
 }
 
 const (
@@ -98,6 +104,9 @@ type ProxyConfig struct {
 	Verbose                     bool
 	TraceDir                    string
 	ClearReasoningCache         bool
+	NgrokEnabled                bool
+	NgrokAuthtoken              string
+	NgrokURL                    string
 	EnvPath                     string
 	LoadedEnvFiles              []string
 }
@@ -220,6 +229,11 @@ func fromEnv(envPath string) (ProxyConfig, error) {
 		errs = append(errs, err.Error())
 	}
 
+	ngrokEnabled, err := envBool(EnvNgrokEnabled, false)
+	if err != nil {
+		errs = append(errs, err.Error())
+	}
+
 	if len(errs) > 0 {
 		return ProxyConfig{}, fmt.Errorf("configuration errors:\n  - %s", strings.Join(errs, "\n  - "))
 	}
@@ -243,6 +257,9 @@ func fromEnv(envPath string) (ProxyConfig, error) {
 		Verbose:                     verbose,
 		TraceDir:                    envStr(EnvTraceDir, ""),
 		ClearReasoningCache:         clearCache,
+		NgrokEnabled:                ngrokEnabled,
+		NgrokAuthtoken:              strings.TrimSpace(os.Getenv(EnvNgrokAuthtoken)),
+		NgrokURL:                    normalizeNgrokURL(strings.TrimSpace(os.Getenv(EnvNgrokURL))),
 		EnvPath:                     envPath,
 	}, nil
 }
@@ -317,6 +334,13 @@ func normalizeMissingReasoningStrategy(v string) string {
 	return strings.ToLower(strings.TrimSpace(v))
 }
 
+func normalizeNgrokURL(v string) string {
+	if strings.HasSuffix(v, "/") && !strings.HasSuffix(v, "//") {
+		return strings.TrimSuffix(v, "/")
+	}
+	return v
+}
+
 // Validate checks all configuration constraints and returns an error describing
 // any problems found.
 func (c ProxyConfig) Validate() error {
@@ -364,6 +388,18 @@ func (c ProxyConfig) Validate() error {
 		errs = append(errs, "REASONING_CACHE_MAX_ROWS must not be negative")
 	}
 
+	if c.NgrokEnabled {
+		if c.NgrokAuthtoken == "" {
+			errs = append(errs, "NGROK_AUTHTOKEN must not be empty when NGROK_ENABLED=true")
+		}
+		if c.NgrokURL != "" {
+			u, err := url.Parse(c.NgrokURL)
+			if err != nil || !u.IsAbs() || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.Contains(c.NgrokURL, "#") || (u.Path != "" && u.Path != "/") {
+				errs = append(errs, "NGROK_URL must be an absolute https URL with a hostname and no path, userinfo, query, or fragment")
+			}
+		}
+	}
+
 	if len(errs) > 0 {
 		return fmt.Errorf("configuration validation failed:\n  - %s", strings.Join(errs, "\n  - "))
 	}
@@ -397,6 +433,15 @@ func (c ProxyConfig) StartupSummary() string {
 	}
 	if c.ClearReasoningCache {
 		fmt.Fprintf(&b, "  Clear Cache:        true (one-shot)\n")
+	}
+	if !c.NgrokEnabled {
+		fmt.Fprintf(&b, "  Ngrok:              disabled\n")
+	} else if c.NgrokURL == "" {
+		fmt.Fprintf(&b, "  Ngrok:              enabled\n")
+		fmt.Fprintf(&b, "  Ngrok Endpoint:     random\n")
+	} else {
+		fmt.Fprintf(&b, "  Ngrok:              enabled\n")
+		fmt.Fprintf(&b, "  Ngrok Endpoint:     %s\n", c.NgrokURL)
 	}
 	if len(c.LoadedEnvFiles) > 0 {
 		b.WriteString("  Env Files:\n")

@@ -2,10 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -13,6 +17,7 @@ import (
 	"dsproxy/internal/log"
 	"dsproxy/internal/proxy"
 	"dsproxy/internal/reasoning"
+	"dsproxy/internal/tunnel"
 )
 
 func main() {
@@ -25,24 +30,26 @@ func run() int {
 		log.Error("config error", "err", err)
 		return 2
 	}
-
 	if err := cfg.Validate(); err != nil {
 		log.Error("config validation", "err", err)
 		return 2
 	}
 
-	log.Init(cfg.Verbose)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return runConfigured(ctx, cfg, tunnel.NewNgrokProvider, net.Listen)
+}
 
-	log.Info("startup",
-		"version", "dev",
-		"host", cfg.Host,
-		"port", cfg.Port,
-	)
+type tunnelProviderFactory func() tunnel.Provider
+type listenFunc func(network, address string) (net.Listener, error)
+
+func runConfigured(ctx context.Context, cfg config.ProxyConfig, newProvider tunnelProviderFactory, listen listenFunc) int {
+	log.Init(cfg.Verbose)
+	log.Info("startup", "version", "dev", "host", cfg.Host, "port", cfg.Port)
 	if len(cfg.LoadedEnvFiles) > 0 {
 		log.Info("loaded env files", "files", cfg.LoadedEnvFiles)
 	}
 	log.Info("\n" + cfg.StartupSummary())
-
 	warnInsecureUpstream(cfg.UpstreamBaseURL)
 
 	store, err := reasoning.Open(cfg.ReasoningContentPath, cfg.ReasoningCacheMaxAgeSeconds, cfg.ReasoningCacheMaxRows)
@@ -51,7 +58,6 @@ func run() int {
 		return 2
 	}
 	defer store.Close()
-
 	if cfg.ClearReasoningCache {
 		n, err := store.Clear()
 		if err != nil {
@@ -69,27 +75,68 @@ func run() int {
 		log.Info("exposed_base_url", "url", u)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	local, err := listen("tcp", net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)))
+	if err != nil {
+		log.Error("local listener", "err", err)
+		return 1
+	}
 
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- srv.ListenAndServe()
-	}()
+	var endpoint tunnel.Endpoint
+	if cfg.NgrokEnabled {
+		endpoint, err = newProvider().Listen(ctx, tunnel.NewConfig(cfg.NgrokAuthtoken, cfg.NgrokURL))
+		if err != nil {
+			_ = local.Close()
+			if ctx.Err() != nil {
+				return 0
+			}
+			log.Error("embedded ngrok startup", "err", err)
+			return 1
+		}
+		defer endpoint.Close()
+		log.Info("public_base_url", "url", strings.TrimRight(endpoint.PublicURL(), "/")+"/v1")
+	}
 
-	select {
-	case <-ctx.Done():
+	type serveResult struct {
+		component string
+		err       error
+	}
+	resultCount := 1
+	errs := make(chan serveResult, 2)
+	go func() { errs <- serveResult{"local", srv.Serve(local)} }()
+	if endpoint != nil {
+		resultCount++
+		go func() { errs <- serveResult{"ngrok", srv.Serve(endpoint)} }()
+	}
+
+	shutdown := func(completed int) {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
-		return 0
-	case err := <-errCh:
-		if err != nil && err != http.ErrServerClosed {
-			log.Error("server error", "err", err)
-			return 1
+		if endpoint != nil {
+			_ = endpoint.Close()
 		}
-		return 0
+		for range resultCount - completed {
+			<-errs
+		}
 	}
+
+	select {
+	case <-ctx.Done():
+		shutdown(0)
+		return 0
+	case result := <-errs:
+		if expectedServeError(result.err) {
+			shutdown(1)
+			return 0
+		}
+		log.Error("server error", "component", result.component, "err", result.err)
+		shutdown(1)
+		return 1
+	}
+}
+
+func expectedServeError(err error) bool {
+	return err == nil || errors.Is(err, http.ErrServerClosed)
 }
 
 func warnInsecureUpstream(baseURL string) {

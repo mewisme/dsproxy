@@ -19,6 +19,7 @@ Error 400: The reasoning_content in the thinking mode must be passed back to the
 3. **Recovers** broken histories when possible (`MISSING_REASONING_STRATEGY=recover`), or fails fast in strict mode (`reject`).
 4. **Optionally mirrors** thinking tokens into assistant `content` so UIs can show them (plain or collapsible `<details>` blocks).
 5. **Normalizes** requests for DeepSeek (thinking/reasoning effort, tools, streaming usage, legacy `functions` → `tools`).
+6. **Maps** OpenAI-compatible `user` to opaque DeepSeek `user_id` for privacy-safe rate-limit isolation.
 
 Supported endpoints:
 
@@ -77,6 +78,49 @@ docker run --rm -p "${HOST_PORT:-9999}:9999" \
 
 If Cursor rejects `localhost`, set `HOST=0.0.0.0` in `.env` and use `http://<your-lan-ip>:9999/v1` (startup logs list discovered LAN URLs).
 
+## Embedded ngrok
+
+Cursor requires a public HTTPS URL in some environments. dsproxy can create one directly inside the application with the embedded ngrok Go SDK; no ngrok CLI, sidecar, second container, or extra inbound port is used. It is disabled by default.
+
+### Direct run
+
+```bash
+NGROK_ENABLED=true \
+NGROK_AUTHTOKEN='<token>' \
+go run ./cmd/dsproxy
+```
+
+Or set it in `.env`:
+
+```env
+NGROK_ENABLED=true
+NGROK_AUTHTOKEN=<token>
+NGROK_URL=
+```
+
+Leave `NGROK_URL` empty for a random public URL. dsproxy logs the Cursor-compatible URL after the endpoint is live, for example `https://actual-domain.ngrok.app/v1`. Random URLs can change after restart; local access remains available.
+
+### Reserved URL
+
+```env
+NGROK_ENABLED=true
+NGROK_AUTHTOKEN=<token>
+NGROK_URL=https://my-dsproxy.ngrok.app
+```
+
+The reserved domain must be available to your ngrok account. Do not include `/v1` in `NGROK_URL`; use the logged `https://my-dsproxy.ngrok.app/v1` as Cursor's base URL.
+
+### Docker
+
+Compose passes `.env` into the normal application container, so no second container is needed:
+
+```bash
+docker compose up -d
+docker compose logs -f dsproxy
+```
+
+The public endpoint remains protected by dsproxy's existing bearer-token requirement. Traffic through it passes through ngrok infrastructure and can include the DeepSeek API key in the Authorization header, prompts, source code, system instructions, tool schemas/results, and reasoning history. Enable it only when that exposure is acceptable.
+
 ## Configuration
 
 Copy [`.env.example`](.env.example) to `.env` in the project directory. If no project `.env` exists, `~/.dsproxy/.env` is also loaded.
@@ -104,8 +148,11 @@ Copy [`.env.example`](.env.example) to `.env` in the project directory. If no pr
 | `REASONING_CACHE_MAX_ROWS` | `100000` | Max rows before LRU-style pruning. Set to `0` to disable row-count eviction. |
 | `CLEAR_REASONING_CACHE` | `false` | If `true`, clear entire cache on startup and exit immediately (one-shot maintenance). |
 | `TRACE_DIR` | _(empty)_ | If set, write one JSON trace file per POST `/v1/chat/completions` request. See [Tracing](#tracing). |
+| `NGROK_ENABLED` | `false` | Enable the optional embedded public HTTPS endpoint. |
+| `NGROK_AUTHTOKEN` | _(empty)_ | Required only when ngrok is enabled. Never logged. |
+| `NGROK_URL` | _(empty)_ | Optional reserved HTTPS endpoint. Leave empty for random URL; omit `/v1`. |
 
-### Cache namespace (v2)
+### Cache namespace (v3)
 
 Cache keys are scoped by a namespace derived from:
 
@@ -114,9 +161,32 @@ Cache keys are scoped by a namespace derived from:
 - Model family
 - Thinking mode (enabled/disabled)
 - Reasoning effort
+- Normalized `user_id` (see [User identity mapping](#user-identity-mapping))
 - Runtime context hash (system messages, tools, tool_choice)
 
-Different keys, URLs, models, tools, or system prompts do not share cached reasoning. This prevents cross-tenant reasoning leaks.
+Different keys, URLs, models, tools, system prompts, or user identities do not share cached reasoning. This prevents cross-tenant reasoning leaks.
+
+The namespace version was bumped from `v2` to `v3` to include normalized `user_id`. Old cached data is not migrated; existing rows may remain in SQLite and age out under normal pruning. Deploying this change may cause a one-time cache miss for existing conversations.
+
+### User identity mapping
+
+dsproxy normalizes OpenAI-compatible `user` and DeepSeek-native `user_id` fields before forwarding to the upstream API.
+
+**Precedence rules:**
+
+1. **Explicit valid `user_id`** is preserved unchanged (must match `^[A-Za-z0-9_-]{1,512}$`)
+2. **OpenAI-compatible `user`** is mapped to an opaque, deterministic DeepSeek `user_id` (`u_` prefix + 32 lowercase hex chars)
+3. **Both present**: explicit `user_id` wins; `user` is removed
+4. **Absent, null, empty, or whitespace**: no identity is sent upstream
+
+The opaque mapping uses HMAC-SHA256 keyed by the request's bearer token with domain separation `dsproxy-user-id-v1`. Properties:
+
+- Same API key + same user → same `user_id`
+- Same API key + different user → different `user_id`
+- Different API key + same user → different `user_id`
+- API key rotation changes generated `user_id`
+
+The upstream DeepSeek payload never contains the raw OpenAI `user` value. Invalid `user_id` values (wrong characters, too long, non-string type) return HTTP 400 with `type: invalid_request_error` before making any upstream request.
 
 ### Missing reasoning strategies
 

@@ -144,6 +144,12 @@ func safeValue(key string) string {
 		return "false"
 	case EnvTraceDir:
 		return ""
+	case EnvNgrokEnabled:
+		return "true"
+	case EnvNgrokAuthtoken:
+		return "test-token"
+	case EnvNgrokURL:
+		return "https://example.ngrok.app"
 	default:
 		panic(fmt.Sprintf("safeValue: unknown key %q", key))
 	}

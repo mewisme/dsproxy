@@ -666,3 +666,97 @@ func TestCacheIsolationCompatibleThenIncompatible(t *testing.T) {
 		t.Fatal("re-compatible context: reasoning not restored")
 	}
 }
+
+// --- User ID cache isolation ---
+
+func TestCacheIsolationUserAReasoningNotVisibleToUserB(t *testing.T) {
+	_, _, proxySrv, _ := setupIsolationTest(t)
+
+	systemPrompt := []any{map[string]any{"role": "system", "content": "You are helpful."}}
+	toolDefs := []any{
+		map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "lookup",
+				"description": "Look up.",
+				"parameters":  map[string]any{"type": "object", "properties": map[string]any{}},
+			},
+		},
+	}
+
+	// Turn 1: User A seeds reasoning
+	status, resp := postWithUser(t, proxySrv.URL+"/v1/chat/completions", map[string]any{
+		"model":    "deepseek-v4-pro",
+		"messages": []any{systemPrompt[0], map[string]any{"role": "user", "content": "lookup"}},
+		"tools":    toolDefs,
+		"user":     "user-a",
+	})
+	if status != 200 {
+		t.Fatalf("user A seed status=%d body=%v", status, resp)
+	}
+	first := messageFrom(resp)
+	if first["reasoning_content"] != "isolation-reasoning-v1" {
+		t.Fatalf("seed reasoning=%v", first["reasoning_content"])
+	}
+
+	// Turn 2: User B with same context, reasoning dropped — must NOT restore A's reasoning
+	status, resp = postWithUser(t, proxySrv.URL+"/v1/chat/completions", map[string]any{
+		"model": "deepseek-v4-pro",
+		"messages": []any{
+			systemPrompt[0],
+			map[string]any{"role": "user", "content": "lookup"},
+			dropReasoning(first),
+			map[string]any{"role": "tool", "tool_call_id": "call_lookup", "content": "result"},
+		},
+		"tools": toolDefs,
+		"user":  "user-b",
+	})
+	if status != 200 {
+		t.Fatalf("user B turn status=%d body=%v", status, resp)
+	}
+
+	upstreamReq := isolationRequests[1]["messages"].([]any)
+	assistantMsg := upstreamReq[2].(map[string]any)
+	if _, ok := assistantMsg["reasoning_content"]; ok {
+		t.Fatal("user B must not restore user A's reasoning")
+	}
+
+	// Turn 3: User A again — must restore its own reasoning
+	status, resp = postWithUser(t, proxySrv.URL+"/v1/chat/completions", map[string]any{
+		"model": "deepseek-v4-pro",
+		"messages": []any{
+			systemPrompt[0],
+			map[string]any{"role": "user", "content": "lookup"},
+			dropReasoning(first),
+			map[string]any{"role": "tool", "tool_call_id": "call_lookup", "content": "result"},
+		},
+		"tools": toolDefs,
+		"user":  "user-a",
+	})
+	if status != 200 {
+		t.Fatalf("user A return turn status=%d", status)
+	}
+
+	upstreamReq = isolationRequests[2]["messages"].([]any)
+	assistantMsg = upstreamReq[2].(map[string]any)
+	if rc, ok := assistantMsg["reasoning_content"].(string); !ok || rc != "isolation-reasoning-v1" {
+		t.Fatalf("user A must restore its own reasoning, got %v", assistantMsg["reasoning_content"])
+	}
+}
+
+func postWithUser(t *testing.T, url string, payload map[string]any) (int, map[string]any) {
+	t.Helper()
+	body, _ := json.Marshal(payload)
+	req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer sk-test")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	var out map[string]any
+	_ = json.Unmarshal(data, &out)
+	return resp.StatusCode, out
+}

@@ -84,6 +84,9 @@ func TestDefaults(t *testing.T) {
 	if cfg.ClearReasoningCache {
 		t.Errorf("ClearReasoningCache: got true, want false")
 	}
+	if cfg.NgrokEnabled || cfg.NgrokAuthtoken != "" || cfg.NgrokURL != "" {
+		t.Errorf("ngrok defaults: got enabled=%v token=%q url=%q", cfg.NgrokEnabled, cfg.NgrokAuthtoken, cfg.NgrokURL)
+	}
 	if cfg.ReasoningContentPath == "" {
 		t.Errorf("ReasoningContentPath should have a default")
 	}
@@ -240,6 +243,97 @@ func TestInvalidBool(t *testing.T) {
 	_, err := fromEnv(".")
 	if err == nil {
 		t.Error("expected error for invalid CORS")
+	}
+}
+
+func TestNgrokEnabledBoolVariants(t *testing.T) {
+	for _, value := range []string{"1", "true", "yes", "on", "0", "false", "no", "off"} {
+		clearEnv(t)
+		setenv(t, EnvNgrokEnabled, value)
+		cfg, err := fromEnv(".")
+		if err != nil {
+			t.Fatalf("fromEnv(%q): %v", value, err)
+		}
+		want := value == "1" || value == "true" || value == "yes" || value == "on"
+		if cfg.NgrokEnabled != want {
+			t.Errorf("NGROK_ENABLED=%q: got %v, want %v", value, cfg.NgrokEnabled, want)
+		}
+	}
+}
+
+func TestInvalidNgrokEnabled(t *testing.T) {
+	clearEnv(t)
+	setenv(t, EnvNgrokEnabled, "maybe")
+	if _, err := fromEnv("."); err == nil {
+		t.Fatal("expected invalid NGROK_ENABLED to fail parsing")
+	}
+}
+
+func TestNgrokDisabledDoesNotRequireOrValidateSettings(t *testing.T) {
+	clearEnv(t)
+	setenv(t, EnvNgrokAuthtoken, "secret")
+	setenv(t, EnvNgrokURL, "http://not-valid-when-disabled")
+	cfg, err := fromEnv(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("disabled ngrok settings must be ignored: %v", err)
+	}
+}
+
+func TestNgrokEnabledValidation(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+		ok   bool
+		want string
+	}{
+		{"random", "", true, ""},
+		{"https", " https://example.ngrok.app/ ", true, "https://example.ngrok.app"},
+		{"http", "http://example.ngrok.app", false, ""},
+		{"relative", "example.ngrok.app", false, ""},
+		{"path", "https://example.ngrok.app/v1", false, ""},
+		{"query", "https://example.ngrok.app?foo=bar", false, ""},
+		{"empty query", "https://example.ngrok.app?", false, ""},
+		{"fragment", "https://example.ngrok.app#x", false, ""},
+		{"empty fragment", "https://example.ngrok.app/#", false, ""},
+		{"userinfo", "https://user@example.ngrok.app", false, ""},
+		{"multiple slashes", "https://example.ngrok.app//", false, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clearEnv(t)
+			setenv(t, EnvNgrokEnabled, "true")
+			setenv(t, EnvNgrokAuthtoken, "secret")
+			setenv(t, EnvNgrokURL, tt.url)
+			cfg, err := fromEnv(".")
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = cfg.Validate()
+			if tt.ok && err != nil {
+				t.Fatalf("Validate: %v", err)
+			}
+			if !tt.ok && err == nil {
+				t.Fatal("expected validation error")
+			}
+			if tt.want != "" && cfg.NgrokURL != tt.want {
+				t.Errorf("NgrokURL: got %q, want %q", cfg.NgrokURL, tt.want)
+			}
+		})
+	}
+}
+
+func TestNgrokEnabledRequiresToken(t *testing.T) {
+	clearEnv(t)
+	setenv(t, EnvNgrokEnabled, "true")
+	cfg, err := fromEnv(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), EnvNgrokAuthtoken) {
+		t.Fatalf("expected missing token error, got %v", err)
 	}
 }
 
@@ -403,6 +497,29 @@ func TestStartupSummaryTraceDirSet(t *testing.T) {
 	}
 }
 
+func TestStartupSummaryNgrokIsSafe(t *testing.T) {
+	clearEnv(t)
+	cfg, _ := fromEnv(".")
+	if !strings.Contains(cfg.StartupSummary(), "Ngrok:              disabled") {
+		t.Fatal("disabled ngrok summary missing")
+	}
+
+	setenv(t, EnvNgrokEnabled, "true")
+	setenv(t, EnvNgrokAuthtoken, "very-secret-token")
+	setenv(t, EnvNgrokURL, "https://example.ngrok.app/")
+	cfg, err := fromEnv(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary := cfg.StartupSummary()
+	if !strings.Contains(summary, "Ngrok Endpoint:     https://example.ngrok.app") {
+		t.Fatalf("configured endpoint missing: %s", summary)
+	}
+	if strings.Contains(summary, "very-secret-token") || strings.Contains(summary, EnvNgrokAuthtoken) {
+		t.Fatalf("summary exposed token: %s", summary)
+	}
+}
+
 // --- URL trailing slash trimming ---
 
 func TestBaseURLTrailingSlashTrimmed(t *testing.T) {
@@ -465,6 +582,7 @@ func TestApplicationEnvVarsHasAllConstants(t *testing.T) {
 		EnvMissingReasoningStrategy, EnvReasoningContentPath,
 		EnvReasoningCacheMaxAgeSeconds, EnvReasoningCacheMaxRows,
 		EnvClearReasoningCache, EnvTraceDir,
+		EnvNgrokEnabled, EnvNgrokAuthtoken, EnvNgrokURL,
 	} {
 		found := false
 		for _, a := range ApplicationEnvVars {
