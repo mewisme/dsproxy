@@ -2,10 +2,10 @@ package reasoning
 
 import (
 	"crypto/sha256"
+	"dsproxy/internal/jsoncanon"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"dsproxy/internal/jsoncanon"
 )
 
 func NormalizeToolCall(toolCall map[string]any) map[string]any {
@@ -41,7 +41,7 @@ func NormalizeToolCall(toolCall map[string]any) map[string]any {
 func ToolCallSignature(toolCall map[string]any) string {
 	normalized := NormalizeToolCall(toolCall)
 	delete(normalized, "id")
-	return sha256JSON(normalized)
+	return Sha256JSON(normalized)
 }
 
 func ToolCallIDs(message map[string]any) []string {
@@ -92,7 +92,7 @@ func MessageSignature(message map[string]any) string {
 		"content":    content,
 		"tool_calls": toolCalls,
 	}
-	return sha256JSON(payload)
+	return Sha256JSON(payload)
 }
 
 func CanonicalScopeMessage(message map[string]any) map[string]any {
@@ -126,7 +126,7 @@ func ConversationScope(messages []map[string]any, namespace string) string {
 			"messages":  scopeMessages,
 		}
 	}
-	return sha256JSON(payload)
+	return Sha256JSON(payload)
 }
 
 func TurnContextSignature(priorMessages []map[string]any) string {
@@ -151,7 +151,7 @@ func TurnContextSignature(priorMessages []map[string]any) string {
 		}
 		context = append(context, CanonicalScopeMessage(m))
 	}
-	return sha256JSON(context)
+	return Sha256JSON(context)
 }
 
 func ScopedReasoningKeys(message map[string]any, scope string) []string {
@@ -196,7 +196,7 @@ func PortableReasoningKeys(message map[string]any, cacheNamespace string, priorM
 	return keys
 }
 
-func sha256JSON(payload any) string {
+func Sha256JSON(payload any) string {
 	b, err := jsoncanon.Marshal(payload)
 	if err != nil {
 		b, _ = json.Marshal(payload)

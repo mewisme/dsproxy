@@ -16,8 +16,8 @@ type Choice struct {
 }
 
 type Accumulator struct {
-	choices        map[int]*Choice
-	storedChoices  map[string]string
+	choices       map[int]*Choice
+	storedChoices map[string]string
 }
 
 func NewAccumulator() *Accumulator {

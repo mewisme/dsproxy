@@ -2,10 +2,11 @@ package proxy
 
 import (
 	"encoding/json"
-	"log/slog"
 	"net/http"
 	"strings"
 	"time"
+
+	"dsproxy/internal/log"
 
 	"dsproxy/internal/transform"
 )
@@ -43,7 +44,7 @@ func (h *Handler) logIncoming(r *http.Request) {
 	if h.hasAuthorization(r) {
 		attrs = append(attrs, "authorization", "bearer")
 	}
-	slog.Info("incoming request", attrs...)
+	log.Info("incoming request", attrs...)
 }
 
 func (h *Handler) logCompleted(r *http.Request, rec *responseRecorder, started time.Time, extra ...any) {
@@ -56,7 +57,7 @@ func (h *Handler) logCompleted(r *http.Request, rec *responseRecorder, started t
 		"remote", r.RemoteAddr,
 	}
 	attrs = append(attrs, extra...)
-	slog.Info("request completed", attrs...)
+	log.Info("request completed", attrs...)
 }
 
 func (h *Handler) hasAuthorization(r *http.Request) bool {
@@ -92,15 +93,15 @@ func preparedSummary(prepared transform.PreparedRequest) []any {
 
 func summarizeJSONBody(label string, body []byte) {
 	if len(body) == 0 {
-		slog.Debug(label, "body", "(empty)")
+		log.Debug(label, "body", "(empty)")
 		return
 	}
 	var payload any
 	if err := json.Unmarshal(body, &payload); err != nil {
-		slog.Debug(label, "body_bytes", len(body), "parse_error", err.Error())
+		log.Debug(label, "body_bytes", len(body), "parse_error", err.Error())
 		return
 	}
-	slog.Debug(label, "body", payload)
+	log.Debug(label, "body", payload)
 }
 
 func redactAuthorizationHeader(r *http.Request) http.Header {

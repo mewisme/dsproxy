@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"dsproxy/internal/config"
-	"dsproxy/internal/jsoncanon"
 	"dsproxy/internal/reasoning"
 )
 
@@ -459,29 +458,79 @@ func UpstreamModelFor(original string, cfg config.ProxyConfig) string {
 	return original
 }
 
-func ReasoningModelFamily(upstreamModel string) string {
-	if upstreamModel == "deepseek-v4-pro" || upstreamModel == "deepseek-v4-flash" {
-		return "deepseek-v4"
+func normalizedSystemMessages(messages []map[string]any) []map[string]any {
+	var result []map[string]any
+	for _, m := range messages {
+		if m["role"] != "system" {
+			continue
+		}
+		cm := map[string]any{"role": m["role"], "content": m["content"]}
+		if name, ok := m["name"]; ok {
+			cm["name"] = name
+		}
+		result = append(result, cm)
 	}
-	return upstreamModel
+	return result
 }
 
-func ReasoningCacheNamespace(cfg config.ProxyConfig, upstreamModel string, thinking, reasoningEffort any, authorization string) string {
+func normalizedToolsForContext(tools any) []any {
+	if tools == nil {
+		return []any{}
+	}
+	t, _ := tools.([]any)
+	if t == nil {
+		return []any{}
+	}
+	return t
+}
+
+func effectiveToolChoice(tools []any, explicit any) any {
+	if explicit != nil {
+		return explicit
+	}
+	if len(tools) > 0 {
+		return "auto"
+	}
+	return "none"
+}
+
+func RuntimeContextHash(systemMessages []map[string]any, tools any, toolChoice any) string {
+	var canonical []map[string]any
+	for _, m := range systemMessages {
+		if m["role"] != "system" {
+			continue
+		}
+		cm := map[string]any{"role": m["role"], "content": m["content"]}
+		if name, ok := m["name"]; ok {
+			cm["name"] = name
+		}
+		canonical = append(canonical, cm)
+	}
+	t := normalizedToolsForContext(tools)
+	payload := map[string]any{
+		"system_messages": canonical,
+		"tools":           t,
+		"tool_choice":     effectiveToolChoice(t, toolChoice),
+	}
+	return reasoning.Sha256JSON(payload)
+}
+
+func ReasoningCacheNamespace(cfg config.ProxyConfig, upstreamModel string, thinking, reasoningEffort any, authorization string, runtimeContextHash string) string {
 	authHash := ""
 	if authorization != "" {
 		sum := sha256.Sum256([]byte(authorization))
 		authHash = hex.EncodeToString(sum[:])
 	}
 	payload := map[string]any{
-		"base_url":           cfg.UpstreamBaseURL,
-		"model":              ReasoningModelFamily(upstreamModel),
-		"thinking":           thinking,
-		"reasoning_effort":   reasoningEffort,
-		"authorization_hash": authHash,
+		"v":                    "v2",
+		"base_url":             cfg.UpstreamBaseURL,
+		"model":                upstreamModel,
+		"thinking":             thinking,
+		"reasoning_effort":     reasoningEffort,
+		"authorization_hash":   authHash,
+		"runtime_context_hash": runtimeContextHash,
 	}
-	b, _ := jsoncanon.Marshal(payload)
-	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:])
+	return reasoning.Sha256JSON(payload)
 }
 
 func ResponseRecordingContexts(items ...*RecordingContext) []RecordingContext {
@@ -570,8 +619,12 @@ func PrepareUpstreamRequest(
 		prepared["reasoning_effort"] = NormalizeReasoningEffort(cfg.ReasoningEffort)
 	}
 
-	cacheNamespace := ReasoningCacheNamespace(cfg, upstreamModel, prepared["thinking"], prepared["reasoning_effort"], authorization)
-	preRepair, _, _ := NormalizeMessages(payload["messages"], nil, cacheNamespace, false, !thinkingDisabled)
+	preRepair, _, _ := NormalizeMessages(payload["messages"], nil, "", false, !thinkingDisabled)
+	systemMessages := normalizedSystemMessages(preRepair)
+	tools := normalizedToolsForContext(prepared["tools"])
+	toolChoice := effectiveToolChoice(tools, prepared["tool_choice"])
+	contextHash := RuntimeContextHash(systemMessages, tools, toolChoice)
+	cacheNamespace := ReasoningCacheNamespace(cfg, upstreamModel, prepared["thinking"], prepared["reasoning_effort"], authorization, contextHash)
 	recordMessages := preRepair
 	recordScope := reasoning.ConversationScope(recordMessages, cacheNamespace)
 	messagesForRepair := preRepair

@@ -299,3 +299,370 @@ func writeJSON(w http.ResponseWriter, status int, body map[string]any) {
 func contains(s, sub string) bool {
 	return bytes.Contains([]byte(s), []byte(sub))
 }
+
+// --- Cache isolation E2E tests ---
+
+var isolationRequests []map[string]any
+
+func isolationFakeDeepSeek(w http.ResponseWriter, r *http.Request) {
+	var payload map[string]any
+	_ = json.NewDecoder(r.Body).Decode(&payload)
+	isolationRequests = append(isolationRequests, payload)
+	messages, _ := payload["messages"].([]any)
+
+	lastUser := lastIndex(messages, "user")
+	lastTool := lastIndex(messages, "tool")
+	lastAssistant := lastIndex(messages, "assistant")
+
+	switch {
+	case lastUser >= 0 && lastAssistant == -1 && lastTool == -1:
+		writeJSON(w, 200, completion("chatcmpl-iso-1", "tool_calls", "", "isolation-reasoning-v1", []any{
+			map[string]any{
+				"id": "call_lookup", "type": "function",
+				"function": map[string]any{"name": "lookup", "arguments": "{}"},
+			},
+		}))
+	case lastTool != -1:
+		writeJSON(w, 200, completion("chatcmpl-iso-2", "stop", "The answer is 42.", "isolation-reasoning-v2", nil))
+	default:
+		writeJSON(w, 200, completion("chatcmpl-iso-fallback", "stop", "fallback", "", nil))
+	}
+}
+
+func setupIsolationTest(t *testing.T) (*httptest.Server, *reasoning.Store, *httptest.Server, config.ProxyConfig) {
+	t.Helper()
+	isolationRequests = nil
+	upstream := httptest.NewServer(http.HandlerFunc(isolationFakeDeepSeek))
+	t.Cleanup(upstream.Close)
+
+	store, err := reasoning.Open(":memory:", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	cfg := config.ProxyConfig{
+		Host:                     "0.0.0.0",
+		Port:                     0,
+		UpstreamBaseURL:          upstream.URL,
+		UpstreamModel:            "deepseek-v4-pro",
+		Thinking:                 "enabled",
+		ReasoningEffort:          "max",
+		MissingReasoningStrategy: "recover",
+		DisplayReasoning:         false,
+		MaxRequestBodyBytes:      config.DefaultMaxRequestBodyBytes,
+		RequestTimeout:           30,
+	}
+	proxySrv := httptest.NewServer(proxy.NewServer(cfg, store).HTTP.Handler)
+	t.Cleanup(proxySrv.Close)
+
+	return upstream, store, proxySrv, cfg
+}
+
+func TestCacheIsolationCompatibleContextRestoresReasoning(t *testing.T) {
+	_, _, proxySrv, _ := setupIsolationTest(t)
+
+	systemPrompt := []any{map[string]any{"role": "system", "content": "You are a helpful assistant."}}
+	toolDefs := []any{
+		map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "lookup",
+				"description": "Look up information.",
+				"parameters":  map[string]any{"type": "object", "properties": map[string]any{}},
+			},
+		},
+	}
+
+	// Turn 1: seed reasoning with context A
+	status, resp := post(t, proxySrv.URL+"/v1/chat/completions", map[string]any{
+		"model":    "deepseek-v4-pro",
+		"messages": []any{systemPrompt[0], map[string]any{"role": "user", "content": "lookup"}},
+		"tools":    toolDefs,
+	})
+	if status != 200 {
+		t.Fatalf("seed status=%d body=%v", status, resp)
+	}
+	first := messageFrom(resp)
+	if first["reasoning_content"] != "isolation-reasoning-v1" {
+		t.Fatalf("seed reasoning=%v", first["reasoning_content"])
+	}
+
+	// Turn 2: replay with same context, reasoning dropped
+	status, resp = post(t, proxySrv.URL+"/v1/chat/completions", map[string]any{
+		"model": "deepseek-v4-pro",
+		"messages": []any{
+			systemPrompt[0],
+			map[string]any{"role": "user", "content": "lookup"},
+			dropReasoning(first),
+			map[string]any{"role": "tool", "tool_call_id": "call_lookup", "content": "result"},
+		},
+		"tools": toolDefs,
+	})
+	if status != 200 {
+		t.Fatalf("compatible turn 2 status=%d", status)
+	}
+
+	// Verify upstream received reasoning (restored by compatible context)
+	upstreamReq := isolationRequests[1]["messages"].([]any)
+	assistantMsg := upstreamReq[2].(map[string]any)
+	if rc, ok := assistantMsg["reasoning_content"].(string); !ok || rc != "isolation-reasoning-v1" {
+		t.Fatalf("expected restored reasoning, got %v", assistantMsg["reasoning_content"])
+	}
+}
+
+func TestCacheIsolationDifferentSystemPromptDoesNotRestore(t *testing.T) {
+	_, _, proxySrv, _ := setupIsolationTest(t)
+
+	systemA := []any{map[string]any{"role": "system", "content": "You are helpful."}}
+	systemB := []any{map[string]any{"role": "system", "content": "You are grumpy."}}
+	toolDefs := []any{
+		map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "lookup",
+				"description": "Look up.",
+				"parameters":  map[string]any{"type": "object", "properties": map[string]any{}},
+			},
+		},
+	}
+
+	// Turn 1: seed reasoning with system A
+	status, resp := post(t, proxySrv.URL+"/v1/chat/completions", map[string]any{
+		"model":    "deepseek-v4-pro",
+		"messages": []any{systemA[0], map[string]any{"role": "user", "content": "lookup"}},
+		"tools":    toolDefs,
+	})
+	if status != 200 {
+		t.Fatalf("seed status=%d", status)
+	}
+	first := messageFrom(resp)
+
+	// Turn 2: same turn but with system B, reasoning dropped
+	status, resp = post(t, proxySrv.URL+"/v1/chat/completions", map[string]any{
+		"model": "deepseek-v4-pro",
+		"messages": []any{
+			systemB[0],
+			map[string]any{"role": "user", "content": "lookup"},
+			dropReasoning(first),
+			map[string]any{"role": "tool", "tool_call_id": "call_lookup", "content": "result"},
+		},
+		"tools": toolDefs,
+	})
+	if status != 200 {
+		t.Fatalf("different-system turn 2 status=%d body=%v", status, resp)
+	}
+
+	// Verify upstream did NOT receive stale reasoning
+	upstreamReq := isolationRequests[1]["messages"].([]any)
+	assistantMsg := upstreamReq[2].(map[string]any)
+	if _, ok := assistantMsg["reasoning_content"]; ok {
+		t.Fatal("stale reasoning leaked into upstream with different system prompt")
+	}
+}
+
+func TestCacheIsolationDifferentToolSchemaDoesNotRestore(t *testing.T) {
+	_, _, proxySrv, _ := setupIsolationTest(t)
+
+	systemPrompt := []any{map[string]any{"role": "system", "content": "You are helpful."}}
+	toolsA := []any{
+		map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "lookup",
+				"description": "Look up anything.",
+				"parameters": map[string]any{
+					"type":       "object",
+					"properties": map[string]any{"query": map[string]any{"type": "string"}},
+					"required":   []any{"query"},
+				},
+			},
+		},
+	}
+	toolsB := []any{
+		map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "lookup",
+				"description": "Look up anything.",
+				"parameters": map[string]any{
+					"type":       "object",
+					"properties": map[string]any{"term": map[string]any{"type": "string"}},
+					"required":   []any{"term"},
+				},
+			},
+		},
+	}
+
+	// Turn 1: seed reasoning with tools A
+	status, resp := post(t, proxySrv.URL+"/v1/chat/completions", map[string]any{
+		"model":    "deepseek-v4-pro",
+		"messages": []any{systemPrompt[0], map[string]any{"role": "user", "content": "lookup"}},
+		"tools":    toolsA,
+	})
+	if status != 200 {
+		t.Fatalf("seed status=%d", status)
+	}
+	first := messageFrom(resp)
+
+	// Turn 2: same turn but with tools B, reasoning dropped
+	status, resp = post(t, proxySrv.URL+"/v1/chat/completions", map[string]any{
+		"model": "deepseek-v4-pro",
+		"messages": []any{
+			systemPrompt[0],
+			map[string]any{"role": "user", "content": "lookup"},
+			dropReasoning(first),
+			map[string]any{"role": "tool", "tool_call_id": "call_lookup", "content": "result"},
+		},
+		"tools": toolsB,
+	})
+	if status != 200 {
+		t.Fatalf("different-tool turn 2 status=%d body=%v", status, resp)
+	}
+
+	// Verify upstream did NOT receive stale reasoning
+	upstreamReq := isolationRequests[1]["messages"].([]any)
+	assistantMsg := upstreamReq[2].(map[string]any)
+	if _, ok := assistantMsg["reasoning_content"]; ok {
+		t.Fatal("stale reasoning leaked into upstream with different tool schema")
+	}
+}
+
+func TestCacheIsolationDifferentToolChoiceDoesNotRestore(t *testing.T) {
+	_, _, proxySrv, _ := setupIsolationTest(t)
+
+	systemPrompt := []any{map[string]any{"role": "system", "content": "You are helpful."}}
+	toolDefs := []any{
+		map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "lookup",
+				"description": "Look up.",
+				"parameters":  map[string]any{"type": "object", "properties": map[string]any{}},
+			},
+		},
+	}
+
+	// Turn 1: seed with tool_choice=auto
+	status, resp := post(t, proxySrv.URL+"/v1/chat/completions", map[string]any{
+		"model":       "deepseek-v4-pro",
+		"messages":    []any{systemPrompt[0], map[string]any{"role": "user", "content": "lookup"}},
+		"tools":       toolDefs,
+		"tool_choice": "auto",
+	})
+	if status != 200 {
+		t.Fatalf("seed status=%d", status)
+	}
+	first := messageFrom(resp)
+
+	// Turn 2: same turn but with tool_choice=required, reasoning dropped
+	status, resp = post(t, proxySrv.URL+"/v1/chat/completions", map[string]any{
+		"model": "deepseek-v4-pro",
+		"messages": []any{
+			systemPrompt[0],
+			map[string]any{"role": "user", "content": "lookup"},
+			dropReasoning(first),
+			map[string]any{"role": "tool", "tool_call_id": "call_lookup", "content": "result"},
+		},
+		"tools":       toolDefs,
+		"tool_choice": "required",
+	})
+	if status != 200 {
+		t.Fatalf("different-tool-choice turn 2 status=%d", status)
+	}
+
+	// Verify upstream did NOT receive stale reasoning
+	upstreamReq := isolationRequests[1]["messages"].([]any)
+	assistantMsg := upstreamReq[2].(map[string]any)
+	if _, ok := assistantMsg["reasoning_content"]; ok {
+		t.Fatal("stale reasoning leaked into upstream with different tool_choice")
+	}
+}
+
+func TestCacheIsolationCompatibleThenIncompatible(t *testing.T) {
+	// Full cycle: seed → compatible restore works → incompatible miss → back to compatible restores again
+	_, _, proxySrv, _ := setupIsolationTest(t)
+
+	systemA := []any{map[string]any{"role": "system", "content": "You are helpful."}}
+	toolDefs := []any{
+		map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "lookup",
+				"description": "Look up.",
+				"parameters":  map[string]any{"type": "object", "properties": map[string]any{}},
+			},
+		},
+	}
+
+	// Turn 1: seed reasoning with context A
+	status, resp := post(t, proxySrv.URL+"/v1/chat/completions", map[string]any{
+		"model":    "deepseek-v4-pro",
+		"messages": []any{systemA[0], map[string]any{"role": "user", "content": "lookup"}},
+		"tools":    toolDefs,
+	})
+	if status != 200 {
+		t.Fatalf("seed status=%d", status)
+	}
+	seed := messageFrom(resp)
+	if seed["reasoning_content"] != "isolation-reasoning-v1" {
+		t.Fatalf("seed reasoning=%v", seed["reasoning_content"])
+	}
+
+	// Turn 2: compatible context — reasoning should be restored
+	status, _ = post(t, proxySrv.URL+"/v1/chat/completions", map[string]any{
+		"model": "deepseek-v4-pro",
+		"messages": []any{
+			systemA[0],
+			map[string]any{"role": "user", "content": "lookup"},
+			dropReasoning(seed),
+			map[string]any{"role": "tool", "tool_call_id": "call_lookup", "content": "result"},
+		},
+		"tools": toolDefs,
+	})
+	if status != 200 {
+		t.Fatalf("compatible turn status=%d", status)
+	}
+	req := isolationRequests[1]["messages"].([]any)
+	if rc, ok := req[2].(map[string]any)["reasoning_content"].(string); !ok || rc != "isolation-reasoning-v1" {
+		t.Fatal("compatible context: reasoning not restored")
+	}
+
+	// Turn 3: incompatible — different system prompt
+	status, _ = post(t, proxySrv.URL+"/v1/chat/completions", map[string]any{
+		"model": "deepseek-v4-pro",
+		"messages": []any{
+			map[string]any{"role": "system", "content": "You are grumpy."},
+			map[string]any{"role": "user", "content": "lookup"},
+			dropReasoning(seed),
+			map[string]any{"role": "tool", "tool_call_id": "call_lookup", "content": "result"},
+		},
+		"tools": toolDefs,
+	})
+	if status != 200 {
+		t.Fatalf("incompatible turn status=%d", status)
+	}
+	req = isolationRequests[2]["messages"].([]any)
+	if _, ok := req[2].(map[string]any)["reasoning_content"]; ok {
+		t.Fatal("incompatible context: stale reasoning leaked")
+	}
+
+	// Turn 4: back to compatible — should restore again
+	status, _ = post(t, proxySrv.URL+"/v1/chat/completions", map[string]any{
+		"model": "deepseek-v4-pro",
+		"messages": []any{
+			systemA[0],
+			map[string]any{"role": "user", "content": "lookup"},
+			dropReasoning(seed),
+			map[string]any{"role": "tool", "tool_call_id": "call_lookup", "content": "result"},
+		},
+		"tools": toolDefs,
+	})
+	if status != 200 {
+		t.Fatalf("re-compatible turn status=%d", status)
+	}
+	req = isolationRequests[3]["messages"].([]any)
+	if rc, ok := req[2].(map[string]any)["reasoning_content"].(string); !ok || rc != "isolation-reasoning-v1" {
+		t.Fatal("re-compatible context: reasoning not restored")
+	}
+}

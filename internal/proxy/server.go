@@ -3,10 +3,11 @@ package proxy
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"net"
 	"net/http"
 	"time"
+
+	"dsproxy/internal/log"
 
 	"dsproxy/internal/config"
 	"dsproxy/internal/reasoning"
@@ -39,7 +40,7 @@ func NewServer(cfg config.ProxyConfig, store *reasoning.Store) *Server {
 }
 
 func (s *Server) ListenAndServe() error {
-	slog.Info("listening", "addr", s.HTTP.Addr, "base_url", fmt.Sprintf("http://%s/v1", s.HTTP.Addr))
+	log.Info("listening", "addr", s.HTTP.Addr, "base_url", fmt.Sprintf("http://%s/v1", s.HTTP.Addr))
 	return s.HTTP.ListenAndServe()
 }
 

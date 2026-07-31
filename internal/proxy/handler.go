@@ -6,13 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	"dsproxy/internal/config"
+	"dsproxy/internal/log"
 	"dsproxy/internal/reasoning"
 	"dsproxy/internal/stream"
 	"dsproxy/internal/transform"
@@ -115,7 +115,7 @@ func (h *Handler) sendModels(w http.ResponseWriter) {
 
 func (h *Handler) handlePost(w http.ResponseWriter, r *http.Request, path string, started time.Time) {
 	if path != "/chat/completions" && path != "/v1/chat/completions" {
-		slog.Warn("rejected unsupported path", "path", path)
+		log.Warn("rejected unsupported path", "path", path)
 		writeJSON(w, http.StatusNotFound, map[string]any{
 			"error": map[string]any{"message": "Only /v1/chat/completions is supported"},
 		})
@@ -123,7 +123,7 @@ func (h *Handler) handlePost(w http.ResponseWriter, r *http.Request, path string
 	}
 	auth := cursorAuthorization(r)
 	if auth == "" {
-		slog.Warn("rejected missing authorization", "path", path)
+		log.Warn("rejected missing authorization", "path", path)
 		writeJSON(w, http.StatusUnauthorized, map[string]any{
 			"error": map[string]any{"message": "Missing Authorization bearer token"},
 		})
@@ -135,23 +135,23 @@ func (h *Handler) handlePost(w http.ResponseWriter, r *http.Request, path string
 		if err == errBodyTooLarge {
 			status = http.StatusRequestEntityTooLarge
 		}
-		slog.Warn("rejected request body", "error", err.Error(), "status", status)
+		log.Warn("rejected request body", "error", err.Error(), "status", status)
 		writeJSON(w, status, map[string]any{"error": map[string]any{"message": err.Error()}})
 		return
 	}
 
 	attrs := chatPayloadSummary(payload)
-	slog.Info("chat completion request", attrs...)
+	log.Info("chat completion request", attrs...)
 	if h.Config.Verbose {
-		slog.Debug("client request headers", "headers", redactAuthorizationHeader(r))
+		log.Debug("client request headers", "headers", redactAuthorizationHeader(r))
 		summarizeJSONBody("client request body", mustMarshal(payload))
 	}
 
 	cfg := h.configForRequest(payload)
 	prepared := transform.PrepareUpstreamRequest(payload, cfg, h.Store, auth)
-	slog.Info("upstream request prepared", preparedSummary(prepared)...)
+	log.Info("upstream request prepared", preparedSummary(prepared)...)
 	if h.Config.MissingReasoningStrategy == "reject" && prepared.MissingReasoningMessages > 0 {
-		slog.Warn(
+		log.Warn(
 			"rejected missing reasoning",
 			"missing_reasoning_messages", prepared.MissingReasoningMessages,
 		)
@@ -177,7 +177,7 @@ func (h *Handler) handlePost(w http.ResponseWriter, r *http.Request, path string
 
 	upstreamURL := h.Config.UpstreamBaseURL + "/chat/completions"
 	streaming, _ := prepared.Payload["stream"].(bool)
-	slog.Info("forwarding upstream", "url", upstreamURL, "stream", streaming, "body_bytes", len(upstreamBody))
+	log.Info("forwarding upstream", "url", upstreamURL, "stream", streaming, "body_bytes", len(upstreamBody))
 	if h.Config.Verbose {
 		summarizeJSONBody("upstream request body", upstreamBody)
 	}
@@ -201,14 +201,14 @@ func (h *Handler) handlePost(w http.ResponseWriter, r *http.Request, path string
 	upstreamStarted := time.Now()
 	resp, err := h.Client.Do(req)
 	if err != nil {
-		slog.Error("upstream request failed", "error", err, "duration_ms", time.Since(upstreamStarted).Milliseconds())
+		log.Error("upstream request failed", "error", err, "duration_ms", time.Since(upstreamStarted).Milliseconds())
 		writeJSON(w, http.StatusBadGateway, map[string]any{
 			"error": map[string]any{"message": fmt.Sprintf("Upstream request failed: %v", err)},
 		})
 		return
 	}
 	defer resp.Body.Close()
-	slog.Info(
+	log.Info(
 		"upstream response",
 		"status", resp.StatusCode,
 		"stream", streaming,
@@ -248,7 +248,7 @@ func (h *Handler) proxyRegular(w http.ResponseWriter, resp *http.Response, prepa
 	if h.Config.Verbose {
 		summarizeJSONBody("client response body", rewritten)
 	}
-	slog.Info("chat completion response", "status", resp.StatusCode, "body_bytes", len(rewritten))
+	log.Info("chat completion response", "status", resp.StatusCode, "body_bytes", len(rewritten))
 	h.sendCORS(w)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
@@ -308,9 +308,9 @@ func (h *Handler) proxyStreaming(w http.ResponseWriter, resp *http.Response, pre
 		for _, ctx := range contexts {
 			_ = accumulator.StoreReasoning(h.Store, ctx.Scope, prepared.CacheNamespace, ctx.Messages)
 		}
-		slog.Warn("streaming ended before done", "finalized", finalized)
+		log.Warn("streaming ended before done", "finalized", finalized)
 	}
-	slog.Info(
+	log.Info(
 		"chat completion stream finished",
 		"upstream_status", resp.StatusCode,
 		"finalized", finalized,
