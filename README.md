@@ -1,272 +1,523 @@
+<div align="center">
+
 # dsproxy
 
-OpenAI-compatible local proxy for [DeepSeek V4](https://www.deepseek.com/) thinking mode with tool calls. It repairs missing `reasoning_content` in chat history so clients like [Cursor](https://cursor.com/) can keep multi-turn agent sessions working.
+**An OpenAI-compatible proxy that makes DeepSeek V4 thinking mode work reliably in Cursor and other coding agents.**
 
-Your API key stays in the client: dsproxy forwards the `Authorization` header to DeepSeek and does not store credentials.
+[![Release](https://github.com/mewisme/dsproxy/actions/workflows/release.yml/badge.svg)](https://github.com/mewisme/dsproxy/actions/workflows/release.yml)
+[![Latest release](https://img.shields.io/github/v/release/mewisme/dsproxy?display_name=tag&sort=semver)](https://github.com/mewisme/dsproxy/releases)
+[![Go version](https://img.shields.io/github/go-mod/go-version/mewisme/dsproxy)](https://github.com/mewisme/dsproxy/blob/main/go.mod)
+[![License](https://img.shields.io/github/license/mewisme/dsproxy)](https://github.com/mewisme/dsproxy/blob/main/LICENSE)
+[![Container](https://img.shields.io/badge/container-ghcr.io%2Fmewisme%2Fdsproxy-2496ED?logo=docker&logoColor=white)](https://github.com/mewisme/dsproxy/pkgs/container/dsproxy)
 
-## The problem
+[Quick start](#quick-start) · [Cursor setup](#cursor-setup) · [Embedded ngrok](#embedded-ngrok) · [Configuration](#configuration) · [Security](#security)
 
-DeepSeek thinking mode requires prior assistant `reasoning_content` to be sent back on tool-call turns. Many OpenAI clients omit that field, which produces:
+</div>
+
+> [!IMPORTANT]
+> `dsproxy` is an independent compatibility proxy. It is not affiliated with or endorsed by DeepSeek, Cursor, OpenAI, or ngrok.
+
+## Why dsproxy?
+
+DeepSeek thinking-mode tool calls require every assistant tool-call message to be replayed with its original `reasoning_content`. Some OpenAI-compatible clients omit that field when they send conversation history back to the API, causing requests to fail with errors such as:
 
 ```text
 Error 400: The reasoning_content in the thinking mode must be passed back to the API.
 ```
 
-## What dsproxy does
+`dsproxy` sits between the client and DeepSeek and keeps that conversation state usable:
 
-1. **Caches** `reasoning_content` from DeepSeek responses in a local SQLite database.
-2. **Injects** cached reasoning into later requests when the client omits it.
-3. **Recovers** broken histories when possible (`MISSING_REASONING_STRATEGY=recover`), or fails fast in strict mode (`reject`).
-4. **Optionally mirrors** thinking tokens into assistant `content` so UIs can show them (plain or collapsible `<details>` blocks).
-5. **Normalizes** requests for DeepSeek (thinking/reasoning effort, tools, streaming usage, legacy `functions` → `tools`).
-6. **Maps** OpenAI-compatible `user` to opaque DeepSeek `user_id` for privacy-safe rate-limit isolation.
+- stores returned `reasoning_content` in a local SQLite cache;
+- restores missing reasoning for later tool-call turns;
+- recovers from unrecoverable history when configured to do so;
+- preserves streaming, tool calls, usage chunks, and OpenAI-compatible response shapes;
+- optionally mirrors thinking into assistant `content` for clients that cannot render `reasoning_content` directly;
+- maps OpenAI-compatible `user` values to opaque DeepSeek `user_id` values;
+- can expose the same proxy handler through an embedded public ngrok HTTPS endpoint.
 
-Supported endpoints:
+## Features
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| `GET` | `/health`, `/healthz`, `/v1/health`, `/v1/healthz` | Health check |
-| `GET` | `/models`, `/v1/models` | Model list for client discovery |
-| `POST` | `/chat/completions`, `/v1/chat/completions` | Proxied chat (only supported API) |
+- **OpenAI-compatible endpoints** for models and chat completions
+- **DeepSeek V4 thinking mode** with `reasoning_content` replay
+- **Streaming SSE support** with optional reasoning display
+- **Tool-call history repair** backed by SQLite
+- **Strict or recovery mode** for missing reasoning
+- **Privacy-safe user identity mapping** and cache isolation
+- **Embedded ngrok** without a CLI, subprocess, or sidecar container
+- **Docker and direct-run support**
+- **Strict configuration validation** with deterministic precedence
+- **Optional request tracing** with sensitive header redaction
+- **Graceful shutdown** for local and public listeners
+
+## Supported endpoints
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `GET` | `/v1/models` | List supported DeepSeek models |
+| `GET` | `/models` | Compatibility alias for `/v1/models` |
+| `POST` | `/v1/chat/completions` | OpenAI-compatible chat completions |
+| `POST` | `/chat/completions` | Compatibility alias for `/v1/chat/completions` |
+
+Chat-completion requests require an `Authorization: Bearer ...` header. The bearer token is forwarded to the configured upstream DeepSeek-compatible API. The model-list endpoints are read-only discovery routes.
+
+## How it works
+
+```text
+Cursor / OpenAI-compatible client
+                │
+                │  /v1/chat/completions
+                ▼
+          ┌───────────┐
+          │  dsproxy  │
+          ├───────────┤
+          │ normalize │
+          │ repair    │◄──── SQLite reasoning cache
+          │ stream    │
+          └─────┬─────┘
+                │
+                │  DeepSeek Chat Completions API
+                ▼
+         api.deepseek.com
+```
+
+When embedded ngrok is enabled, the local TCP listener and the ngrok listener serve the same HTTP handler:
+
+```text
+                         ┌── http://127.0.0.1:9999/v1
+same dsproxy handler ────┤
+                         └── https://<domain>.ngrok.app/v1
+```
 
 ## Quick start
 
-### From source
-
-Requires Go 1.26+.
-
-```bash
-git clone https://github.com/mewisme/dsproxy.git
-cd dsproxy
-cp .env.example .env
-go run ./cmd/dsproxy
-```
-
-Default base URL: `http://127.0.0.1:9999/v1`
-
 ### Docker Compose
 
+Docker Compose is the simplest persistent setup.
+
 ```bash
 cp .env.example .env
-# Docker: the container always binds 0.0.0.0:9999 (set in docker-compose.yml).
-# Use HOST_PORT to change the published port on the host.
-# HOST_PORT=8080   # optional — host side only (maps to container :9999)
+docker compose up -d
+docker compose logs -f dsproxy
+```
 
+The default local base URL is:
+
+```text
+http://127.0.0.1:9999/v1
+```
+
+Update the image later with:
+
+```bash
 docker compose pull
 docker compose up -d
 ```
 
-Health check: `curl http://127.0.0.1:9999/health` (use your `HOST_PORT` value if you changed the host mapping)
-
-### Published image (no Compose)
+Stop the service with:
 
 ```bash
-docker pull ghcr.io/mewisme/dsproxy:latest
-docker run --rm -p "${HOST_PORT:-9999}:9999" \
+docker compose down
+```
+
+The reasoning cache is stored in the named `dsproxy-cache` volume and survives container recreation.
+
+### Docker run
+
+```bash
+docker run --rm \
+  -p 9999:9999 \
   --env-file .env \
+  -e HOST=0.0.0.0 \
+  -e PORT=9999 \
   -v dsproxy-cache:/home/nonroot/.dsproxy \
   ghcr.io/mewisme/dsproxy:latest
 ```
 
-## Cursor setup
+### Run from source
 
-1. Start dsproxy (default `http://127.0.0.1:9999`).
-2. In Cursor → **Models** → add a custom model:
-   - **Model:** `deepseek-v4-pro` or `deepseek-v4-flash`
-   - **API key:** your DeepSeek API key
-   - **Base URL:** `http://127.0.0.1:9999/v1`
+Requirements:
 
-If Cursor rejects `localhost`, set `HOST=0.0.0.0` in `.env` and use `http://<your-lan-ip>:9999/v1` (startup logs list discovered LAN URLs).
-
-## Embedded ngrok
-
-Cursor requires a public HTTPS URL in some environments. dsproxy can create one directly inside the application with the embedded ngrok Go SDK; no ngrok CLI, sidecar, second container, or extra inbound port is used. It is disabled by default.
-
-### Direct run
+- Go version declared in [`go.mod`](go.mod)
+- a DeepSeek-compatible API key supplied by the client
 
 ```bash
-NGROK_ENABLED=true \
-NGROK_AUTHTOKEN='<token>' \
+git clone https://github.com/mewisme/dsproxy.git
+cd dsproxy
 go run ./cmd/dsproxy
 ```
 
-Or set it in `.env`:
+Or build a local binary:
+
+```bash
+go build -o dsproxy ./cmd/dsproxy
+./dsproxy
+```
+
+Direct runs bind to `127.0.0.1:9999` by default and work without a `.env` file. When reusing `.env.example` outside Docker, comment out its container-specific `REASONING_CONTENT_PATH` value or replace it with a host path.
+
+## Cursor setup
+
+Configure Cursor to use an OpenAI-compatible provider with:
+
+| Setting | Value |
+|---|---|
+| Base URL | `http://127.0.0.1:9999/v1` or the logged ngrok URL |
+| API key | Your DeepSeek API key |
+| Model | `deepseek-v4-pro` or `deepseek-v4-flash` |
+
+Use the base URL exactly as logged by `dsproxy`, including `/v1`.
+
+Some Cursor environments reject private or loopback API URLs. In that case, enable the embedded ngrok endpoint described below instead of exposing the local port manually.
+
+## Embedded ngrok
+
+`dsproxy` embeds the official ngrok Go SDK. No ngrok CLI, child process, second container, agent configuration file, or additional inbound port is required.
+
+Ngrok is disabled by default.
+
+### Random public URL
+
+Set the following values in `.env`:
 
 ```env
 NGROK_ENABLED=true
-NGROK_AUTHTOKEN=<token>
+NGROK_AUTHTOKEN=<your-ngrok-authtoken>
 NGROK_URL=
 ```
 
-Leave `NGROK_URL` empty for a random public URL. dsproxy logs the Cursor-compatible URL after the endpoint is live, for example `https://actual-domain.ngrok.app/v1`. Random URLs can change after restart; local access remains available.
+Then start `dsproxy` normally:
 
-### Reserved URL
-
-```env
-NGROK_ENABLED=true
-NGROK_AUTHTOKEN=<token>
-NGROK_URL=https://my-dsproxy.ngrok.app
+```bash
+go run ./cmd/dsproxy
 ```
 
-The reserved domain must be available to your ngrok account. Do not include `/v1` in `NGROK_URL`; use the logged `https://my-dsproxy.ngrok.app/v1` as Cursor's base URL.
-
-### Docker
-
-Compose passes `.env` into the normal application container, so no second container is needed:
+or:
 
 ```bash
 docker compose up -d
 docker compose logs -f dsproxy
 ```
 
-The public endpoint remains protected by dsproxy's existing bearer-token requirement. Traffic through it passes through ngrok infrastructure and can include the DeepSeek API key in the Authorization header, prompts, source code, system instructions, tool schemas/results, and reasoning history. Enable it only when that exposure is acceptable.
+After the endpoint is ready, the application logs a Cursor-compatible URL:
+
+```text
+public_base_url=https://example.ngrok.app/v1
+```
+
+A randomly assigned URL may change after restart.
+
+### Reserved URL
+
+To use a domain available to your ngrok account:
+
+```env
+NGROK_ENABLED=true
+NGROK_AUTHTOKEN=<your-ngrok-authtoken>
+NGROK_URL=https://my-dsproxy.ngrok.app
+```
+
+Do not append `/v1` to `NGROK_URL`; `dsproxy` appends it when displaying the public base URL.
+
+### Failure behavior
+
+When ngrok is enabled:
+
+- a missing token or invalid URL fails configuration validation;
+- an authentication or endpoint startup failure stops application startup;
+- `dsproxy` does not silently fall back to local-only mode;
+- local and ngrok serving are shut down together on a terminal listener failure or operating-system signal.
+
+> [!WARNING]
+> An ngrok endpoint is public. Requests can contain the DeepSeek API key, prompts, source code, system instructions, tool definitions, tool results, and reasoning history. Chat-completion requests still require a bearer token, but traffic passes through ngrok infrastructure. Enable the tunnel only when that exposure is acceptable.
+
+## API examples
+
+### List models
+
+```bash
+curl http://127.0.0.1:9999/v1/models
+```
+
+### Streaming chat completion
+
+```bash
+curl -N http://127.0.0.1:9999/v1/chat/completions \
+  -H 'Authorization: Bearer sk-your-deepseek-key' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "deepseek-v4-pro",
+    "messages": [
+      {"role": "user", "content": "Explain this repository."}
+    ],
+    "stream": true
+  }'
+```
 
 ## Configuration
 
-Copy [`.env.example`](.env.example) to `.env` in the project directory. If no project `.env` exists, `~/.dsproxy/.env` is also loaded.
+Copy [`.env.example`](.env.example) to `.env` and adjust it as needed.
 
-**Precedence:** process environment > project `.env` > `~/.dsproxy/.env` > built-in defaults.
+Configuration precedence is:
+
+```text
+process environment
+  > project .env
+  > ~/.dsproxy/.env
+  > built-in defaults
+```
+
+Unknown variables are ignored by the application. Recognized variables are validated before listeners are opened.
 
 | Variable | Default | Description |
-|----------|---------|-------------|
-| `HOST` | `127.0.0.1` | Bind address. Use `0.0.0.0` for LAN or Docker. |
-| `PORT` | `9999` | Listen port (keep `9999` in Docker; app port inside the container) |
-| `HOST_PORT` | `9999` | Docker Compose / `docker run -p` only — published port on the host (`HOST_PORT:9999`) |
-| `BASE_URL` | `https://api.deepseek.com` | Upstream DeepSeek API base URL |
-| `MODEL` | `deepseek-v4-pro` | Default model when the client omits `model` |
-| `THINKING` | `enabled` | `enabled` or `disabled` — forwarded as DeepSeek `thinking.type` |
-| `REASONING_EFFORT` | `max` | `low` / `medium` / `high` / `max` |
-| `DISPLAY_REASONING` | `true` | Mirror thinking into streamed assistant `content` |
-| `COLLAPSIBLE_REASONING` | `true` | Use `<details><summary>Thinking</summary>…</details>` when displaying. Only takes effect when `DISPLAY_REASONING=true`. |
-| `VERBOSE` | `false` | Debug logging (request/response summaries). **WARNING:** may expose sensitive data in logs, including request bodies and headers. |
-| `REQUEST_TIMEOUT` | `300` | Upstream HTTP client timeout and server read timeout (seconds) |
-| `MAX_REQUEST_BODY_BYTES` | `20971520` | Max client request body size (20 MiB) |
-| `CORS` | `false` | Send CORS headers on all responses (`Access-Control-Allow-Origin: *`). No `Access-Control-Allow-Credentials` is sent. |
-| `MISSING_REASONING_STRATEGY` | `recover` | `recover` (cache + trim history) or `reject` (HTTP 409) |
-| `REASONING_CONTENT_PATH` | `~/.dsproxy/reasoning_content.sqlite3` | SQLite cache file. Relative paths are resolved against the project directory. Set to `:memory:` for an in-memory store (not persisted). |
-| `REASONING_CACHE_MAX_AGE_SECONDS` | `2592000` | Evict cache rows older than this (30 days). Set to `0` to disable age-based eviction. |
-| `REASONING_CACHE_MAX_ROWS` | `100000` | Max rows before LRU-style pruning. Set to `0` to disable row-count eviction. |
-| `CLEAR_REASONING_CACHE` | `false` | If `true`, clear entire cache on startup and exit immediately (one-shot maintenance). |
-| `TRACE_DIR` | _(empty)_ | If set, write one JSON trace file per POST `/v1/chat/completions` request. See [Tracing](#tracing). |
-| `NGROK_ENABLED` | `false` | Enable the optional embedded public HTTPS endpoint. |
-| `NGROK_AUTHTOKEN` | _(empty)_ | Required only when ngrok is enabled. Never logged. |
-| `NGROK_URL` | _(empty)_ | Optional reserved HTTPS endpoint. Leave empty for random URL; omit `/v1`. |
+|---|---:|---|
+| `HOST` | `127.0.0.1` | Local bind address. Docker Compose overrides this to `0.0.0.0`. |
+| `PORT` | `9999` | Local listen port. Docker Compose keeps the container port at `9999`. |
+| `HOST_PORT` | `9999` | Docker Compose host-side published port. Not used by the Go server directly. |
+| `BASE_URL` | `https://api.deepseek.com` | Upstream API base URL, without `/chat/completions`. |
+| `MODEL` | `deepseek-v4-pro` | Default upstream model when the client omits `model`. |
+| `THINKING` | `enabled` | DeepSeek thinking mode: `enabled` or `disabled`. |
+| `REASONING_EFFORT` | `max` | Reasoning effort: `low`, `medium`, `high`, or `max`. |
+| `DISPLAY_REASONING` | `true` | Mirror streamed reasoning into assistant `content`. |
+| `COLLAPSIBLE_REASONING` | `true` | Wrap displayed reasoning in an HTML `<details>` block. Effective only when display is enabled. |
+| `VERBOSE` | `false` | Enable debug request and response summaries. May expose sensitive body content in logs. |
+| `REQUEST_TIMEOUT` | `300` | Upstream HTTP client and server read timeout in seconds. |
+| `MAX_REQUEST_BODY_BYTES` | `20971520` | Maximum client request body size, in bytes. |
+| `CORS` | `false` | Add permissive CORS response headers. Credentials are not enabled. |
+| `NGROK_ENABLED` | `false` | Enable the embedded public HTTPS endpoint. |
+| `NGROK_AUTHTOKEN` | _(empty)_ | Required only when ngrok is enabled. Never included in the startup summary. |
+| `NGROK_URL` | _(empty)_ | Optional reserved HTTPS endpoint. Leave empty for a random URL and omit `/v1`. |
+| `REASONING_CONTENT_PATH` | `~/.dsproxy/reasoning_content.sqlite3` | SQLite reasoning-cache path. Relative paths are resolved against the project directory. Use `:memory:` for an in-memory cache. |
+| `MISSING_REASONING_STRATEGY` | `recover` | `recover` trims unrecoverable history and continues; `reject` returns HTTP 409. |
+| `REASONING_CACHE_MAX_AGE_SECONDS` | `2592000` | Maximum cache age, 30 days by default. Set `0` to disable age-based eviction. |
+| `REASONING_CACHE_MAX_ROWS` | `100000` | Maximum row count before pruning. Set `0` to disable row-count eviction. |
+| `CLEAR_REASONING_CACHE` | `false` | Clear the entire cache at startup and exit. Intended for one-shot maintenance. |
+| `TRACE_DIR` | _(empty)_ | Directory for one JSON trace per chat-completion request. Disabled when empty. |
 
-### Cache namespace (v3)
+### Docker-specific values
 
-Cache keys are scoped by a namespace derived from:
+The Compose file intentionally overrides the in-container listener:
 
-- API key hash (SHA-256 prefix)
-- Upstream base URL
-- Model family
-- Thinking mode (enabled/disabled)
-- Reasoning effort
-- Normalized `user_id` (see [User identity mapping](#user-identity-mapping))
-- Runtime context hash (system messages, tools, tool_choice)
+```yaml
+environment:
+  HOST: "0.0.0.0"
+  PORT: "9999"
+```
 
-Different keys, URLs, models, tools, system prompts, or user identities do not share cached reasoning. This prevents cross-tenant reasoning leaks.
+Use `HOST_PORT` to change only the host-side port:
 
-The namespace version was bumped from `v2` to `v3` to include normalized `user_id`. Old cached data is not migrated; existing rows may remain in SQLite and age out under normal pruning. Deploying this change may cause a one-time cache miss for existing conversations.
+```env
+HOST_PORT=8080
+```
 
-### User identity mapping
+The resulting local base URL is `http://127.0.0.1:8080/v1`.
 
-dsproxy normalizes OpenAI-compatible `user` and DeepSeek-native `user_id` fields before forwarding to the upstream API.
+## Reasoning repair
 
-**Precedence rules:**
+### Why reasoning must be replayed
 
-1. **Explicit valid `user_id`** is preserved unchanged (must match `^[A-Za-z0-9_-]{1,512}$`)
-2. **OpenAI-compatible `user`** is mapped to an opaque, deterministic DeepSeek `user_id` (`u_` prefix + 32 lowercase hex chars)
-3. **Both present**: explicit `user_id` wins; `user` is removed
-4. **Absent, null, empty, or whitespace**: no identity is sent upstream
+In thinking mode, DeepSeek associates tool calls with the assistant's hidden reasoning. On subsequent requests, tool-call assistant messages must include the original `reasoning_content`. `dsproxy` records that content and restores it when a compatible client omits it.
 
-The opaque mapping uses HMAC-SHA256 keyed by the request's bearer token with domain separation `dsproxy-user-id-v1`. Properties:
+### Recovery mode
 
-- Same API key + same user → same `user_id`
-- Same API key + different user → different `user_id`
-- Different API key + same user → different `user_id`
-- API key rotation changes generated `user_id`
+```env
+MISSING_REASONING_STRATEGY=recover
+```
 
-The upstream DeepSeek payload never contains the raw OpenAI `user` value. Invalid `user_id` values (wrong characters, too long, non-string type) return HTTP 400 with `type: invalid_request_error` before making any upstream request.
+When a required reasoning entry cannot be restored, `dsproxy` keeps the usable leading system context and current conversation tail, inserts a recovery instruction, and omits older unrecoverable tool-call history.
 
-### Missing reasoning strategies
+The client may receive a short recovery notice. A recovery is intentionally visible because conversation history was changed.
 
-- **`recover`** (default): Restore `reasoning_content` from SQLite; if some turns are still missing, drop unrecoverable tail messages and continue (may add a short system notice in the repaired context).
-- **`reject`**: Return HTTP 409 with `missing_reasoning_content` when any assistant tool-turn is missing reasoning.
+### Strict mode
 
-### Displaying thinking in the UI
+```env
+MISSING_REASONING_STRATEGY=reject
+```
 
-When `DISPLAY_REASONING=true`, streaming deltas include thinking text in `content`:
+The request is rejected with HTTP `409 Conflict` when required reasoning cannot be restored.
 
-- `COLLAPSIBLE_REASONING=true` → HTML `<details>` blocks (Cursor-friendly)
-- `COLLAPSIBLE_REASONING=false` → `<think>…</think>` wrappers
+### Cache namespace v3
 
-Upstream payloads still carry real `reasoning_content` for API correctness.
+Reasoning cache entries are isolated by a namespace derived from:
+
+- upstream base URL;
+- model;
+- thinking mode;
+- reasoning effort;
+- a hash of the upstream authorization value;
+- normalized `user_id`;
+- runtime context, including system messages, tools, and effective `tool_choice`.
+
+Different API keys, users, models, tools, or system prompts do not share portable reasoning entries.
+
+The namespace version was bumped from `v2` to `v3` when user identity isolation was added. Existing `v2` rows are not migrated and age out through the normal pruning process. The first request after an upgrade may therefore miss older cache entries.
+
+## User identity mapping
+
+DeepSeek uses top-level `user_id`, while OpenAI-compatible clients may send `user`.
+
+`dsproxy` applies these rules before calling the upstream API:
+
+1. A valid explicit `user_id` is preserved unchanged.
+2. Otherwise, a string `user` is converted to an opaque deterministic identifier.
+3. When both are present, the explicit valid `user_id` wins.
+4. Null, empty, and whitespace-only values are omitted.
+5. Invalid explicit values are rejected with HTTP `400` before any upstream request.
+
+Valid explicit IDs match:
+
+```text
+^[A-Za-z0-9_-]{1,512}$
+```
+
+Generated IDs have this shape:
+
+```text
+u_<32 lowercase hexadecimal characters>
+```
+
+The mapping uses HMAC-SHA256 keyed by the request bearer token with the domain separator `dsproxy-user-id-v1`. The raw OpenAI `user` value is never forwarded to DeepSeek. Rotating the API key changes generated user IDs.
+
+## Reasoning display
+
+DeepSeek emits thinking text through `reasoning_content`. When `DISPLAY_REASONING=true`, `dsproxy` also mirrors streamed reasoning into normal assistant `content`.
+
+With `COLLAPSIBLE_REASONING=true`, the mirrored content is rendered as:
+
+```html
+<details>
+<summary>Thinking</summary>
+
+...
+
+</details>
+```
+
+The upstream payload still uses real `reasoning_content`; display adaptation affects only the client-facing stream.
 
 ## Tracing
 
-Set `TRACE_DIR` to a directory path to enable request tracing. Each POST `/v1/chat/completions` request writes one JSON file containing:
+Set `TRACE_DIR` to enable JSON request traces:
 
-- **Timestamp** — when the trace was written
-- **Client request** — method, path, headers (with auth redacted)
-- **Upstream request** — URL, headers (with auth redacted), body
-- **Response status** — upstream HTTP status code
+```env
+TRACE_DIR=./traces
+```
 
-Sensitive headers (`Authorization`, `Proxy-Authorization`, `X-Api-Key`, `Api-Key`) are replaced with `[redacted]` before writing. Trace files are written atomically (temp file + rename) with permissions `0600` in a directory created with `0700`.
+Each successful upstream request produces a file containing:
 
-Trace failures are logged but never propagated — tracing cannot break request handling.
+- UTC timestamp;
+- client method, path, and headers;
+- prepared upstream method, URL, headers, and body;
+- upstream response status.
 
-**Docker:** mount a host directory for trace output:
+Sensitive headers are replaced with `[redacted]`, including:
+
+- `Authorization`;
+- `Proxy-Authorization`;
+- `X-Api-Key`;
+- `Api-Key`.
+
+Trace files are written atomically with restrictive permissions where supported. Trace failures are logged but never break request forwarding.
+
+> [!CAUTION]
+> Redacting authentication headers does not make a trace safe to publish. Upstream bodies can still contain prompts, source code, system instructions, tool definitions, local paths, user identifiers, and complete conversation history.
+
+### Tracing with Docker
+
+The named cache volume is not convenient for retrieving traces. Mount a host directory explicitly:
 
 ```yaml
-volumes:
-  - ./traces:/home/nonroot/traces
-environment:
-  TRACE_DIR: /home/nonroot/traces
+services:
+  dsproxy:
+    volumes:
+      - dsproxy-cache:/home/nonroot/.dsproxy
+      - ./traces:/home/nonroot/traces
+    environment:
+      TRACE_DIR: /home/nonroot/traces
 ```
 
-## Docker notes
+## Security
 
-- The image runs as user `nonroot` (uid 65532). Cache data lives in `/home/nonroot/.dsproxy` (Compose volume `dsproxy-cache`).
-- Compose reads config from `.env` only (`env_file`). `HOST` and `PORT` are overridden to `0.0.0.0` and `9999` in `docker-compose.yml`. Use `HOST_PORT` to change the published port on the host (`${HOST_PORT}:9999`); the app always listens on `PORT` (**9999**) inside the container.
-- `REASONING_CONTENT_PATH` defaults to `/home/nonroot/.dsproxy/reasoning_content.sqlite3` in Compose. Comment out or change this line in `.env` when running directly from source.
+- Chat-completion endpoints require a bearer token; model discovery remains read-only.
+- The bearer token is sent to the configured upstream API.
+- Use an HTTPS `BASE_URL` unless the upstream is a trusted local service.
+- `NGROK_ENABLED` is off by default because it creates a public endpoint.
+- `NGROK_AUTHTOKEN` is not included in the startup summary.
+- `VERBOSE=true` can expose request and response content in logs.
+- `TRACE_DIR` can persist sensitive prompts and workspace context.
+- CORS is disabled by default.
+- Docker runs the application as a non-root user.
 
-Reset a corrupted cache volume:
+Treat the SQLite cache, traces, application logs, and mounted volumes as sensitive data.
+
+## Cache maintenance
+
+Clear the configured cache and exit:
 
 ```bash
-docker compose down
-docker volume rm deepseek-v4-proxy_dsproxy-cache   # project name may vary
-docker compose up -d
+CLEAR_REASONING_CACHE=true ./dsproxy
 ```
 
-Build locally:
+With Docker Compose:
 
 ```bash
-docker build -t dsproxy:local .
-docker run --rm -p "${HOST_PORT:-9999}:9999" --env-file .env -v dsproxy-cache:/home/nonroot/.dsproxy dsproxy:local
+docker compose run --rm -e CLEAR_REASONING_CACHE=true dsproxy
+```
+
+To remove the entire Compose cache volume:
+
+```bash
+docker compose down -v
 ```
 
 ## Development
 
 ```bash
+go mod download
 go test ./...
 go test -race ./...
+go vet ./...
 go build -o dsproxy ./cmd/dsproxy
 ```
 
-Project layout:
+Validate Docker configuration and build the image:
 
-- `cmd/dsproxy` — entrypoint
-- `internal/config` — configuration loading, validation, and env precedence
-- `internal/proxy` — HTTP server, upstream forwarding, CORS, tracing
-- `internal/transform` — request/response normalization and reasoning repair
-- `internal/reasoning` — SQLite cache with scoped key generation
-- `internal/stream` — SSE display adapter
-- `internal/jsoncanon` — deterministic JSON marshaling
+```bash
+docker compose config
+docker build -t dsproxy:dev .
+```
+
+### Project layout
+
+```text
+cmd/dsproxy          application entrypoint and lifecycle
+internal/config      environment loading and strict validation
+internal/jsoncanon   deterministic JSON canonicalization
+internal/log         structured logging helpers
+internal/proxy       HTTP handler, local serving, tracing, and upstream forwarding
+internal/reasoning   SQLite reasoning cache and scoped lookup logic
+internal/stream      SSE accumulation and client display adaptation
+internal/transform   request normalization, reasoning repair, and response rewriting
+internal/tunnel      embedded ngrok provider abstraction and implementation
+```
 
 ## Releases
 
-Image: [`ghcr.io/mewisme/dsproxy:latest`](https://github.com/mewisme/dsproxy/pkgs/container/dsproxy)
+Tagged releases build and publish multi-architecture container images through the repository release workflow.
+
+Primary image:
+
+```text
+ghcr.io/mewisme/dsproxy:latest
+```
+
+Use a version tag in production when reproducibility matters:
+
+```bash
+docker pull ghcr.io/mewisme/dsproxy:<version>
+```
+
+See the [GitHub Releases](https://github.com/mewisme/dsproxy/releases) page for available versions.
 
 ## License
 
-MIT — Copyright (c) 2026 [mewisme](https://github.com/mewisme).
+Distributed under the terms in [LICENSE](LICENSE).

@@ -14,6 +14,12 @@ services:
       # the published port on the host side only.
       HOST: "0.0.0.0"
       PORT: "9999"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9999/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     volumes:
       - dsproxy-cache:/home/nonroot/.dsproxy
     networks:
