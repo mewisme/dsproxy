@@ -47,9 +47,8 @@ Default base URL: `http://127.0.0.1:9999/v1`
 
 ```bash
 cp .env.example .env
-# Docker: bind inside the container and publish on the host
-# HOST=0.0.0.0
-# PORT=9999
+# Docker: the container always binds 0.0.0.0:9999 (set in docker-compose.yml).
+# Use HOST_PORT to change the published port on the host.
 # HOST_PORT=8080   # optional — host side only (maps to container :9999)
 
 docker compose pull
@@ -82,6 +81,8 @@ If Cursor rejects `localhost`, set `HOST=0.0.0.0` in `.env` and use `http://<you
 
 Copy [`.env.example`](.env.example) to `.env` in the project directory. If no project `.env` exists, `~/.dsproxy/.env` is also loaded.
 
+**Precedence:** process environment > project `.env` > `~/.dsproxy/.env` > built-in defaults.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `HOST` | `127.0.0.1` | Bind address. Use `0.0.0.0` for LAN or Docker. |
@@ -90,21 +91,32 @@ Copy [`.env.example`](.env.example) to `.env` in the project directory. If no pr
 | `BASE_URL` | `https://api.deepseek.com` | Upstream DeepSeek API base URL |
 | `MODEL` | `deepseek-v4-pro` | Default model when the client omits `model` |
 | `THINKING` | `enabled` | `enabled` or `disabled` — forwarded as DeepSeek `thinking.type` |
-| `REASONING_EFFORT` | `max` | `low` / `medium` / `high` / `max` (aliases normalized upstream) |
+| `REASONING_EFFORT` | `max` | `low` / `medium` / `high` / `max` |
 | `DISPLAY_REASONING` | `true` | Mirror thinking into streamed assistant `content` |
-| `COLLAPSIBLE_REASONING` | `true` | Use `<details><summary>Thinking</summary>…</details>` when displaying |
-| `VERBOSE` | `false` | Debug logging (request/response summaries) |
-| `REQUEST_TIMEOUT` | `300` | Upstream and server read/write timeout (seconds) |
+| `COLLAPSIBLE_REASONING` | `true` | Use `<details><summary>Thinking</summary>…</details>` when displaying. Only takes effect when `DISPLAY_REASONING=true`. |
+| `VERBOSE` | `false` | Debug logging (request/response summaries). **WARNING:** may expose sensitive data in logs, including request bodies and headers. |
+| `REQUEST_TIMEOUT` | `300` | Upstream HTTP client timeout and server read timeout (seconds) |
 | `MAX_REQUEST_BODY_BYTES` | `20971520` | Max client request body size (20 MiB) |
-| `CORS` | `false` | Send CORS headers on responses |
+| `CORS` | `false` | Send CORS headers on all responses (`Access-Control-Allow-Origin: *`). No `Access-Control-Allow-Credentials` is sent. |
 | `MISSING_REASONING_STRATEGY` | `recover` | `recover` (cache + trim history) or `reject` (HTTP 409) |
-| `REASONING_CONTENT_PATH` | `~/.dsproxy/reasoning_content.sqlite3` | SQLite cache file (empty = default path) |
-| `REASONING_CACHE_MAX_AGE_SECONDS` | `2592000` | Evict cache rows older than this (30 days) |
-| `REASONING_CACHE_MAX_ROWS` | `100000` | Max rows before LRU-style pruning |
-| `CLEAR_REASONING_CACHE` | `false` | If `true`, clear cache on startup and exit (one-shot maintenance) |
-| `TRACE_DIR` | _(empty)_ | If set, write JSON trace files for debugging |
+| `REASONING_CONTENT_PATH` | `~/.dsproxy/reasoning_content.sqlite3` | SQLite cache file. Relative paths are resolved against the project directory. Set to `:memory:` for an in-memory store (not persisted). |
+| `REASONING_CACHE_MAX_AGE_SECONDS` | `2592000` | Evict cache rows older than this (30 days). Set to `0` to disable age-based eviction. |
+| `REASONING_CACHE_MAX_ROWS` | `100000` | Max rows before LRU-style pruning. Set to `0` to disable row-count eviction. |
+| `CLEAR_REASONING_CACHE` | `false` | If `true`, clear entire cache on startup and exit immediately (one-shot maintenance). |
+| `TRACE_DIR` | _(empty)_ | If set, write one JSON trace file per POST `/v1/chat/completions` request. See [Tracing](#tracing). |
 
-Cache keys are scoped per API key hash, upstream URL, model family, and thinking settings — different keys do not share reasoning.
+### Cache namespace (v2)
+
+Cache keys are scoped by a namespace derived from:
+
+- API key hash (SHA-256 prefix)
+- Upstream base URL
+- Model family
+- Thinking mode (enabled/disabled)
+- Reasoning effort
+- Runtime context hash (system messages, tools, tool_choice)
+
+Different keys, URLs, models, tools, or system prompts do not share cached reasoning. This prevents cross-tenant reasoning leaks.
 
 ### Missing reasoning strategies
 
@@ -120,11 +132,33 @@ When `DISPLAY_REASONING=true`, streaming deltas include thinking text in `conten
 
 Upstream payloads still carry real `reasoning_content` for API correctness.
 
+## Tracing
+
+Set `TRACE_DIR` to a directory path to enable request tracing. Each POST `/v1/chat/completions` request writes one JSON file containing:
+
+- **Timestamp** — when the trace was written
+- **Client request** — method, path, headers (with auth redacted)
+- **Upstream request** — URL, headers (with auth redacted), body
+- **Response status** — upstream HTTP status code
+
+Sensitive headers (`Authorization`, `Proxy-Authorization`, `X-Api-Key`, `Api-Key`) are replaced with `[redacted]` before writing. Trace files are written atomically (temp file + rename) with permissions `0600` in a directory created with `0700`.
+
+Trace failures are logged but never propagated — tracing cannot break request handling.
+
+**Docker:** mount a host directory for trace output:
+
+```yaml
+volumes:
+  - ./traces:/home/nonroot/traces
+environment:
+  TRACE_DIR: /home/nonroot/traces
+```
+
 ## Docker notes
 
 - The image runs as user `nonroot` (uid 65532). Cache data lives in `/home/nonroot/.dsproxy` (Compose volume `dsproxy-cache`).
-- Compose reads config from `.env` only (`env_file`). Set `HOST=0.0.0.0` and `PORT=9999` in `.env` for containers. Use `HOST_PORT` to change the published port on the host (`${HOST_PORT}:9999`); the app always listens on `PORT` (**9999**) inside the container.
-- `REASONING_CONTENT_PATH` defaults to `/home/nonroot/.dsproxy/reasoning_content.sqlite3` in Compose.
+- Compose reads config from `.env` only (`env_file`). `HOST` and `PORT` are overridden to `0.0.0.0` and `9999` in `docker-compose.yml`. Use `HOST_PORT` to change the published port on the host (`${HOST_PORT}:9999`); the app always listens on `PORT` (**9999**) inside the container.
+- `REASONING_CONTENT_PATH` defaults to `/home/nonroot/.dsproxy/reasoning_content.sqlite3` in Compose. Comment out or change this line in `.env` when running directly from source.
 
 Reset a corrupted cache volume:
 
@@ -145,25 +179,21 @@ docker run --rm -p "${HOST_PORT:-9999}:9999" --env-file .env -v dsproxy-cache:/h
 
 ```bash
 go test ./...
+go test -race ./...
 go build -o dsproxy ./cmd/dsproxy
 ```
 
 Project layout:
 
 - `cmd/dsproxy` — entrypoint
-- `internal/proxy` — HTTP server and upstream forwarding
+- `internal/config` — configuration loading, validation, and env precedence
+- `internal/proxy` — HTTP server, upstream forwarding, CORS, tracing
 - `internal/transform` — request/response normalization and reasoning repair
-- `internal/reasoning` — SQLite cache
+- `internal/reasoning` — SQLite cache with scoped key generation
 - `internal/stream` — SSE display adapter
+- `internal/jsoncanon` — deterministic JSON marshaling
 
 ## Releases
-
-Tag a version to publish multi-arch images to GHCR:
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
 
 Image: [`ghcr.io/mewisme/dsproxy:latest`](https://github.com/mewisme/dsproxy/pkgs/container/dsproxy)
 

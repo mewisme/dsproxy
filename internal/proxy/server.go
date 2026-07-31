@@ -34,7 +34,9 @@ func NewServer(cfg config.ProxyConfig, store *reasoning.Store) *Server {
 		Handler:           mux,
 		ReadHeaderTimeout: 30 * time.Second,
 		ReadTimeout:       time.Duration(cfg.RequestTimeout * float64(time.Second)),
-		WriteTimeout:      time.Duration(cfg.RequestTimeout * float64(time.Second)),
+		// WriteTimeout must be 0 to prevent killing long SSE streams.
+		// Timeout enforcement relies on http.Client.Timeout and upstream context.
+		WriteTimeout: 0,
 	}
 	return s
 }

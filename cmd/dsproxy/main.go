@@ -26,9 +26,23 @@ func run() int {
 		return 2
 	}
 
+	if err := cfg.Validate(); err != nil {
+		log.Error("config validation", "err", err)
+		return 2
+	}
+
 	log.Init(cfg.Verbose)
 
-	log.Info("loaded config", "env", cfg.EnvPath)
+	log.Info("startup",
+		"version", "dev",
+		"host", cfg.Host,
+		"port", cfg.Port,
+	)
+	if len(cfg.LoadedEnvFiles) > 0 {
+		log.Info("loaded env files", "files", cfg.LoadedEnvFiles)
+	}
+	log.Info("\n" + cfg.StartupSummary())
+
 	warnInsecureUpstream(cfg.UpstreamBaseURL)
 
 	store, err := reasoning.Open(cfg.ReasoningContentPath, cfg.ReasoningCacheMaxAgeSeconds, cfg.ReasoningCacheMaxRows)

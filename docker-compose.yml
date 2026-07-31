@@ -8,6 +8,12 @@ services:
       - "${HOST_PORT:-9999}:9999"
     env_file:
       - .env
+    environment:
+      # Explicit overrides for container runtime.
+      # The container always binds 0.0.0.0:9999; HOST_PORT controls
+      # the published port on the host side only.
+      HOST: "0.0.0.0"
+      PORT: "9999"
     volumes:
       - dsproxy-cache:/home/nonroot/.dsproxy
     networks:

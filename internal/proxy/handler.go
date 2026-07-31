@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"dsproxy/internal/config"
@@ -19,16 +18,23 @@ import (
 )
 
 type Handler struct {
-	Config       config.ProxyConfig
-	Store        *reasoning.Store
-	Client       *http.Client
-	mu           sync.Mutex
-	currentModel string
+	Config config.ProxyConfig
+	Store  *reasoning.Store
+	Client *http.Client
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	rec := &responseRecorder{ResponseWriter: w, status: http.StatusOK}
+
+	// Apply CORS headers middleware-style before routing.
+	if h.Config.CORS {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Origin, Content-Type, Accept, Authorization")
+		w.Header().Set("Access-Control-Expose-Headers", "Content-Length")
+	}
+
 	h.logIncoming(r)
 	defer func() {
 		h.logCompleted(r, rec, started)
@@ -53,7 +59,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleOptions(w http.ResponseWriter, r *http.Request, path string) {
-	h.sendCORS(w)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -68,37 +73,21 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request, path string)
 	}
 }
 
-func (h *Handler) activeModel() string {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.currentModel != "" {
-		return h.currentModel
-	}
-	return h.Config.UpstreamModel
-}
-
+// configForRequest returns a copy of the handler config with the upstream
+// model resolved from the request payload. It does not mutate handler state.
 func (h *Handler) configForRequest(payload map[string]any) config.ProxyConfig {
 	cfg := h.Config
 	if m, ok := payload["model"].(string); ok && strings.TrimSpace(m) != "" {
-		upstream := transform.UpstreamModelFor(strings.TrimSpace(m), cfg)
-		h.mu.Lock()
-		h.currentModel = upstream
-		h.mu.Unlock()
-		return cfg
-	}
-	h.mu.Lock()
-	cm := h.currentModel
-	h.mu.Unlock()
-	if cm != "" {
-		cfg.UpstreamModel = cm
+		cfg.UpstreamModel = transform.UpstreamModelFor(strings.TrimSpace(m), cfg)
 	}
 	return cfg
 }
 
+// sendModels writes a stable model list based on the configured model plus
+// well-known DeepSeek models.
 func (h *Handler) sendModels(w http.ResponseWriter) {
 	created := time.Now().Unix()
-	primary := h.activeModel()
-	ids := []string{primary, h.Config.UpstreamModel, "deepseek-v4-pro", "deepseek-v4-flash"}
+	ids := []string{h.Config.UpstreamModel, "deepseek-v4-pro", "deepseek-v4-flash"}
 	seen := map[string]struct{}{}
 	var models []any
 	for _, id := range ids {
@@ -215,6 +204,11 @@ func (h *Handler) handlePost(w http.ResponseWriter, r *http.Request, path string
 		"duration_ms", time.Since(upstreamStarted).Milliseconds(),
 	)
 
+	// Write trace if enabled (after we know the response status).
+	if h.Config.TraceDir != "" {
+		h.writeChatTrace(r, req, upstreamBody, resp.StatusCode)
+	}
+
 	if streaming {
 		h.proxyStreaming(w, resp, prepared, started)
 		return
@@ -249,14 +243,12 @@ func (h *Handler) proxyRegular(w http.ResponseWriter, resp *http.Response, prepa
 		summarizeJSONBody("client response body", rewritten)
 	}
 	log.Info("chat completion response", "status", resp.StatusCode, "body_bytes", len(rewritten))
-	h.sendCORS(w)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(rewritten)
 }
 
 func (h *Handler) proxyStreaming(w http.ResponseWriter, resp *http.Response, prepared transform.PreparedRequest, started time.Time) {
-	h.sendCORS(w)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "close")
@@ -318,23 +310,38 @@ func (h *Handler) proxyStreaming(w http.ResponseWriter, resp *http.Response, pre
 	)
 }
 
+// writeChatTrace builds a TraceEntry from the client and upstream requests and
+// writes it to the configured trace directory.
+func (h *Handler) writeChatTrace(clientReq *http.Request, upstreamReq *http.Request, upstreamBody []byte, upstreamStatus int) {
+	clientHeaders := redactHeaderValues(headersToMap(clientReq.Header))
+	upstreamHeaders := redactHeaderValues(headersToMap(upstreamReq.Header))
+
+	entry := TraceEntry{
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		Client: TraceRequestInfo{
+			Method:  clientReq.Method,
+			Path:    clientReq.URL.Path,
+			Headers: clientHeaders,
+			Body:    nil, // raw client body is logged via verbose flag
+		},
+		Upstream: TraceRequestInfo{
+			Method:  upstreamReq.Method,
+			URL:     upstreamReq.URL.String(),
+			Headers: upstreamHeaders,
+			Body:    json.RawMessage(upstreamBody),
+		},
+		ResponseStatus: upstreamStatus,
+	}
+
+	writeTrace(h.Config.TraceDir, entry)
+}
+
 func mustMarshal(v any) []byte {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return []byte("{}")
 	}
 	return b
-}
-
-func (h *Handler) sendCORS(w http.ResponseWriter) {
-	if !h.Config.CORS {
-		return
-	}
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Origin, Content-Type, Accept, Authorization")
-	w.Header().Set("Access-Control-Expose-Headers", "Content-Length")
-	w.Header().Set("Access-Control-Allow-Credentials", "true")
 }
 
 var errBodyTooLarge = fmt.Errorf("request body is too large")
